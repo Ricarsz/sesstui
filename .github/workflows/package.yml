@@ -38,22 +38,26 @@ jobs:
               cp /home/builder/pkg/*.pkg.tar.zst /out/
             '
           cd dist
-          sha256sum ./*.pkg.tar.zst > sha256sums.txt
+          mapfile -t pkgs < <(find . -maxdepth 1 -name '*.pkg.tar.zst' ! -name '*-debug-*' -printf '%f\n')
+          sha256sum "${pkgs[@]}" > sha256sums.txt
           cat sha256sums.txt
 
       - name: Upload package artifact
         uses: actions/upload-artifact@v4
         with:
           name: sesstui-arch
-          path: dist/*
+          path: |
+            dist/*.pkg.tar.zst
+            !dist/*-debug-*.pkg.tar.zst
+            dist/sha256sums.txt
 
       - name: Publish GitHub release
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" \
-            dist/*.pkg.tar.zst dist/sha256sums.txt \
+          mapfile -t pkgs < <(find dist -maxdepth 1 -name '*.pkg.tar.zst' ! -name '*-debug-*')
+          gh release create "${GITHUB_REF_NAME}" "${pkgs[@]}" dist/sha256sums.txt \
             --repo "${GITHUB_REPOSITORY}" \
             --title "SessTui ${GITHUB_REF_NAME}" \
             --generate-notes
