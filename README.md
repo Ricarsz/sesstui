@@ -20,7 +20,7 @@ paru -S sesstui
 从仓库里的 `PKGBUILD` 本地构建并安装：
 
 ```sh
-git clone <repo-url> SessTui
+git clone https://github.com/Ricarsz/sesstui.git SessTui
 cd SessTui
 paru -Bi .
 # 或者：makepkg -si
