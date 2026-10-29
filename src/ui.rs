@@ -1,4 +1,4 @@
-//! 渲染：顶栏、会话列表、详情、状态行、帮助与删除确认。
+//! 渲染：顶栏、会话/工作区列表、详情、状态行、帮助与删除确认。
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -10,8 +10,8 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Confirm};
-use crate::model::{Client, Session};
+use crate::app::{App, Confirm, View};
+use crate::model::{Client, Session, WorkspaceGroup};
 use crate::theme::Palette;
 use crate::util;
 
@@ -39,7 +39,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(46), Constraint::Percentage(54)]).areas(body);
-    draw_list(frame, app, left, palette);
+    match app.view {
+        View::Sessions => draw_list(frame, app, left, palette),
+        View::Workspaces => draw_workspaces(frame, app, left, palette),
+    }
     draw_details(frame, app, right, palette);
     draw_status(frame, app, status, palette);
     draw_keys(frame, app, keys, palette);
@@ -73,6 +76,14 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
         ),
         Span::styled(" 会话清理", Style::default().fg(palette.text)),
     ];
+    if app.view.is_workspaces() {
+        title.push(Span::styled(
+            "  工作区",
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     if !app.filter.is_empty() {
         title.push(Span::styled(
             format!("  /{}", app.filter),
@@ -87,7 +98,11 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
     }
     frame.render_widget(Paragraph::new(Line::from(title)), left);
 
-    let mut parts = vec![format!("{} 个会话", app.rows.len())];
+    let mut parts = if app.view.is_workspaces() {
+        vec![format!("{} 个工作区", app.workspaces.len())]
+    } else {
+        vec![format!("{} 个会话", app.rows.len())]
+    };
     if app.marked_count() > 0 {
         parts.push(format!(
             "已选 {} · {}",
@@ -95,12 +110,15 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
             util::human_bytes(app.marked_bytes())
         ));
     }
-    parts.push(util::human_bytes(
+    let bytes = if app.view.is_workspaces() {
+        app.workspaces.iter().map(|group| group.bytes).sum()
+    } else {
         app.rows
             .iter()
             .map(|index| app.sessions[*index].bytes)
-            .sum(),
-    ));
+            .sum()
+    };
+    parts.push(util::human_bytes(bytes));
     if !app.warnings.is_empty() {
         parts.push(format!("{} 警告", app.warnings.len()));
     }
@@ -113,12 +131,24 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
 }
 
 fn draw_list(frame: &mut Frame, app: &mut App, area: Rect, palette: Palette) {
+    let workspace_title = app
+        .filtered_workspace()
+        .map(|group| group.title().to_string());
     let title = if app.filter_editing {
         Line::from(vec![
             Span::styled(" 过滤 ", Style::default().fg(palette.accent)),
             Span::styled(
                 format!("{}▏", app.filter),
                 Style::default().fg(palette.warn),
+            ),
+            Span::styled(" ", Style::default()),
+        ])
+    } else if let Some(name) = &workspace_title {
+        Line::from(vec![
+            Span::styled(" 会话 · ", Style::default().fg(palette.dim)),
+            Span::styled(
+                util::truncate(name, 24),
+                Style::default().fg(palette.accent),
             ),
             Span::styled(" ", Style::default()),
         ])
@@ -134,7 +164,9 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect, palette: Palette) {
     app.list_area = area;
 
     if app.rows.is_empty() {
-        let hint = if app.sessions.is_empty() {
+        let hint = if workspace_title.is_some() {
+            " 这个工作区下没有会话；按 Esc 清除工作区过滤"
+        } else if app.sessions.is_empty() {
             " 没有发现任何会话；按 r 重新扫描"
         } else {
             " 没有匹配的会话；按 / 调整过滤条件"
@@ -174,6 +206,65 @@ fn draw_list(frame: &mut Frame, app: &mut App, area: Rect, palette: Palette) {
     let mut state = ListState::default().with_selected(Some(app.selected));
     frame.render_stateful_widget(list, area, &mut state);
     app.list_offset = state.offset();
+}
+
+fn draw_workspaces(frame: &mut Frame, app: &mut App, area: Rect, palette: Palette) {
+    let title = if app.filter_editing {
+        Line::from(vec![
+            Span::styled(" 过滤工作区 ", Style::default().fg(palette.accent)),
+            Span::styled(
+                format!("{}▏", app.filter),
+                Style::default().fg(palette.warn),
+            ),
+            Span::styled(" ", Style::default()),
+        ])
+    } else if !app.filter.is_empty() {
+        Line::from(format!(" 工作区 · /{} ", app.filter))
+    } else if let Some(client) = app.client_filter {
+        Line::from(format!(" 工作区 · {} ", client.label()))
+    } else {
+        Line::from(" 工作区 ")
+    };
+
+    let inner_width = area.width.saturating_sub(2) as usize;
+    app.list_area = area;
+
+    if app.workspaces.is_empty() {
+        let hint = if app.sessions.is_empty() {
+            " 没有发现任何工作区；按 r 重新扫描"
+        } else {
+            " 没有匹配的工作区；按 / 调整过滤条件"
+        };
+        frame.render_widget(
+            Paragraph::new(hint)
+                .style(Style::default().fg(palette.dim))
+                .block(panel(title, palette)),
+            area,
+        );
+        return;
+    }
+
+    let row_width = inner_width.saturating_sub(2);
+    let sizes = RowWidths::new(row_width);
+    let items: Vec<ListItem> = app
+        .workspaces
+        .iter()
+        .map(|group| ListItem::new(workspace_line(group, &sizes, palette)))
+        .collect();
+
+    let list = List::new(items)
+        .block(panel(title, palette))
+        .highlight_symbol("▌ ")
+        .highlight_style(
+            Style::default()
+                .bg(palette.selected)
+                .fg(palette.text)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    let mut state = ListState::default().with_selected(Some(app.workspace_selected));
+    frame.render_stateful_widget(list, area, &mut state);
+    app.workspace_list_offset = state.offset();
 }
 
 struct RowWidths {
@@ -227,6 +318,34 @@ fn row_line(session: &Session, marked: bool, sizes: &RowWidths, palette: Palette
     ])
 }
 
+fn workspace_line(group: &WorkspaceGroup, sizes: &RowWidths, palette: Palette) -> Line<'static> {
+    let title = util::truncate(group.title(), sizes.title.max(6));
+    let title_width = UnicodeWidthStr::width(title.as_str());
+    let badge = format!("{} ", group.client.badge());
+    let right = format!("{} 个 · {}", group.count(), group.size_label());
+    let right_width = UnicodeWidthStr::width(right.as_str());
+    // 会话行用时间列占位，工作区行没有勾选位，右侧多出来的空间留给计数。
+    let fill = (sizes.title.saturating_sub(title_width) + sizes.size).max(right_width);
+
+    Line::from(vec![
+        Span::styled(
+            format!("{}  ", group.time_label()),
+            Style::default().fg(palette.dim),
+        ),
+        Span::styled(
+            format!("{badge:<width$}", width = sizes.badge),
+            Style::default()
+                .fg(client_color(group.client, palette))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(title, Style::default().fg(palette.text)),
+        Span::styled(
+            format!("{}{right}", " ".repeat(fill.saturating_sub(right_width))),
+            Style::default().fg(palette.dim),
+        ),
+    ])
+}
+
 fn draw_details(frame: &mut Frame, app: &mut App, area: Rect, palette: Palette) {
     let block = panel(" 详情 ", palette);
     let inner = block.inner(area);
@@ -257,6 +376,13 @@ fn draw_details(frame: &mut Frame, app: &mut App, area: Rect, palette: Palette) 
 
 impl App {
     pub fn details(&self) -> Vec<Line<'static>> {
+        match self.view {
+            View::Sessions => self.session_details(),
+            View::Workspaces => self.workspace_details(),
+        }
+    }
+
+    fn session_details(&self) -> Vec<Line<'static>> {
         let palette = self.palette;
         let Some(session) = self.current() else {
             return vec![Line::from(Span::styled(
@@ -265,29 +391,35 @@ impl App {
             ))];
         };
         let mut lines: Vec<Line<'static>> = Vec::new();
-        let kv = |label: &str, value: String| -> Line<'static> {
-            Line::from(vec![
-                Span::styled(
-                    format!("  {}  ", pad(label, 8)),
-                    Style::default().fg(palette.dim),
-                ),
-                Span::styled(value, Style::default().fg(palette.text)),
-            ])
-        };
-
         lines.push(kv(
+            palette,
             "客户端",
             format!("{}（{}）", session.client.label(), session.client.key()),
         ));
-        lines.push(kv("标题", session.title.clone()));
-        lines.push(kv("标识", session.id.clone()));
+        let (workspace_text, workspace_color) = match &session.workspace {
+            Some(workspace) => (
+                format!("{}（{}）", workspace.title, workspace.path),
+                palette.text,
+            ),
+            None => ("未识别 · 按目录归入未知组".to_string(), palette.warn),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("  {}  ", pad("工作区", 8)),
+                Style::default().fg(palette.dim),
+            ),
+            Span::styled(workspace_text, Style::default().fg(workspace_color)),
+        ]));
+        lines.push(kv(palette, "标题", session.title.clone()));
+        lines.push(kv(palette, "标识", session.id.clone()));
         if let Some(cwd) = &session.cwd {
-            lines.push(kv("工作目录", cwd.clone()));
+            lines.push(kv(palette, "工作目录", cwd.clone()));
         }
-        lines.push(kv("存储位置", session.path.display().to_string()));
-        lines.push(kv("根目录", session.root.display().to_string()));
+        lines.push(kv(palette, "存储位置", session.path.display().to_string()));
+        lines.push(kv(palette, "根目录", session.root.display().to_string()));
         lines.push(Line::from(""));
         lines.push(kv(
+            palette,
             "创建",
             session
                 .created
@@ -295,6 +427,7 @@ impl App {
                 .unwrap_or_else(|| "--".to_string()),
         ));
         lines.push(kv(
+            palette,
             "更新",
             format!(
                 "{}（{}）",
@@ -306,6 +439,7 @@ impl App {
             ),
         ));
         lines.push(kv(
+            palette,
             "大小",
             format!(
                 "{} · {} 条消息",
@@ -316,6 +450,7 @@ impl App {
 
         if let Some((input, output)) = session.tokens {
             lines.push(kv(
+                palette,
                 "令牌",
                 format!(
                     "输入 {} · 输出 {}",
@@ -325,7 +460,7 @@ impl App {
             ));
         }
         if let Some(cost) = session.cost {
-            lines.push(kv("费用", format!("${cost:.4}")));
+            lines.push(kv(palette, "费用", format!("${cost:.4}")));
         }
 
         let (state_text, state_color) = if session.locked {
@@ -333,13 +468,7 @@ impl App {
         } else {
             ("空闲", palette.good)
         };
-        lines.push(Line::from(vec![
-            Span::styled(
-                format!("  {}  ", pad("状态", 8)),
-                Style::default().fg(palette.dim),
-            ),
-            Span::styled(state_text.to_string(), Style::default().fg(state_color)),
-        ]));
+        lines.push(state_line(palette, state_text, state_color));
 
         if !session.preview.is_empty() {
             lines.push(Line::from(""));
@@ -358,6 +487,96 @@ impl App {
         }
         lines
     }
+
+    fn workspace_details(&self) -> Vec<Line<'static>> {
+        let palette = self.palette;
+        let Some(group) = self.current_workspace() else {
+            return vec![Line::from(Span::styled(
+                " 没有选中工作区",
+                Style::default().fg(palette.dim),
+            ))];
+        };
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        lines.push(kv(
+            palette,
+            "客户端",
+            format!("{}（{}）", group.client.label(), group.client.key()),
+        ));
+        lines.push(kv(palette, "工作区", group.title().to_string()));
+        lines.push(kv(palette, "标识", group.key.clone()));
+        lines.push(kv(
+            palette,
+            "路径",
+            group.path().unwrap_or("--").to_string(),
+        ));
+        lines.push(Line::from(""));
+        lines.push(kv(palette, "会话", format!("{} 个", group.count())));
+        lines.push(kv(palette, "大小", group.size_label()));
+        lines.push(kv(palette, "消息", format!("{} 条", group.messages)));
+        lines.push(kv(
+            palette,
+            "更新",
+            format!("{}（{}）", group.time_label(), group.age_label()),
+        ));
+        let (state_text, state_color) = if group.locked > 0 {
+            (
+                format!("{} 个会话正在使用，删除会被跳过", group.locked),
+                palette.warn,
+            )
+        } else {
+            ("空闲".to_string(), palette.good)
+        };
+        lines.push(state_line(palette, &state_text, state_color));
+        if let Some(workspace) = &group.workspace {
+            lines.push(Line::from(""));
+            lines.push(kv(palette, "存储桶", workspace.root.display().to_string()));
+            lines.push(kv(
+                palette,
+                "登记",
+                if workspace.is_synthetic() {
+                    "由会话目录推断（未找到客户端登记）".to_string()
+                } else {
+                    "来自客户端登记".to_string()
+                },
+            ));
+        } else {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  这些会话没有工作区信息，只能逐个删除。",
+                Style::default().fg(palette.warn),
+            )));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  Enter 查看该工作区的会话 · d 删除工作区",
+            Style::default().fg(palette.accent),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  删除只清理会话存储与登记，不动项目目录。",
+            Style::default().fg(palette.dim),
+        )));
+        lines
+    }
+}
+
+fn kv(palette: Palette, label: &str, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {}  ", pad(label, 8)),
+            Style::default().fg(palette.dim),
+        ),
+        Span::styled(value, Style::default().fg(palette.text)),
+    ])
+}
+
+fn state_line<'a>(palette: Palette, text: &str, color: ratatui::style::Color) -> Line<'a> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {}  ", pad("状态", 8)),
+            Style::default().fg(palette.dim),
+        ),
+        Span::styled(text.to_string(), Style::default().fg(color)),
+    ])
 }
 
 fn draw_status(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
@@ -375,19 +594,34 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
 }
 
 fn draw_keys(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
-    let mut hints = vec![
-        "↑↓ 选择",
-        "空格 勾选",
-        "a 全选",
-        "d 删除",
-        "Tab 客户端",
-        "/ 过滤",
-        "r 重扫",
-        "t 主题",
-        "? 帮助",
-        "q 退出",
-    ];
-    if app.marked_count() > 0 {
+    let mut hints: Vec<&str> = if app.view.is_workspaces() {
+        vec![
+            "↑↓ 选择",
+            "Enter 查看会话",
+            "d 删除工作区",
+            "w 回会话",
+            "/ 过滤",
+            "r 重扫",
+            "t 主题",
+            "? 帮助",
+            "q 退出",
+        ]
+    } else {
+        vec![
+            "↑↓ 选择",
+            "空格 勾选",
+            "a 全选",
+            "d 删除",
+            "w 工作区",
+            "Tab 客户端",
+            "/ 过滤",
+            "r 重扫",
+            "t 主题",
+            "? 帮助",
+            "q 退出",
+        ]
+    };
+    if app.marked_count() > 0 && !app.view.is_workspaces() {
         hints.insert(4, "Esc 清除");
     }
     let mut line = String::from(" ");
@@ -409,20 +643,31 @@ fn draw_keys(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
 }
 
 fn draw_confirm(frame: &mut Frame, app: &App, area: Rect, modal: &Confirm, palette: Palette) {
-    let sessions: Vec<&Session> = modal
-        .indices
-        .iter()
-        .filter_map(|index| app.sessions.get(*index))
-        .collect();
-    let bytes: u64 = sessions.iter().map(|session| session.bytes).sum();
+    let sessions: Vec<&Session> = app.confirm_sessions(&modal.target);
+    let group = app.confirm_workspace(&modal.target);
+    let bytes: u64 = if let Some(group) = group {
+        group.bytes
+    } else {
+        sessions.iter().map(|session| session.bytes).sum()
+    };
     let locked = sessions.iter().filter(|session| session.locked).count();
+    let deleting_workspace = group.is_some();
 
     let mut body = vec![Line::from(Span::styled(
-        format!(
-            "将永久删除 {} 个会话，释放 {}：",
-            sessions.len(),
-            util::human_bytes(bytes)
-        ),
+        if let Some(group) = group {
+            format!(
+                "将删除工作区「{}」的 {} 个会话，释放 {}：",
+                util::truncate(group.title(), 20),
+                sessions.len(),
+                util::human_bytes(bytes)
+            )
+        } else {
+            format!(
+                "将永久删除 {} 个会话，释放 {}：",
+                sessions.len(),
+                util::human_bytes(bytes)
+            )
+        },
         Style::default().fg(palette.text),
     ))];
     body.push(Line::from(""));
@@ -451,13 +696,21 @@ fn draw_confirm(frame: &mut Frame, app: &App, area: Rect, modal: &Confirm, palet
             Style::default().fg(palette.warn),
         )));
     }
-    body.push(Line::from(Span::styled(
-        "删除后不可恢复。",
-        Style::default().fg(palette.dim),
-    )));
+    if deleting_workspace {
+        body.push(Line::from(Span::styled(
+            "只清理会话存储与登记，项目目录不受影响；删除后不可恢复。",
+            Style::default().fg(palette.dim),
+        )));
+    } else {
+        body.push(Line::from(Span::styled(
+            "删除后不可恢复。",
+            Style::default().fg(palette.dim),
+        )));
+    }
 
     let hint = " Enter / y 确认    Esc / n 取消";
-    let width = 52.min(area.width.saturating_sub(4) as usize) as u16;
+    let width = if deleting_workspace { 58 } else { 52 };
+    let width = width.min(area.width.saturating_sub(4) as usize) as u16;
     let height = (body.len() as u16 + 4).min(area.height.saturating_sub(2));
     let popup = centered(area, width, height);
 
@@ -466,7 +719,14 @@ fn draw_confirm(frame: &mut Frame, app: &App, area: Rect, modal: &Confirm, palet
         .border_type(BorderType::Rounded)
         .title(Line::from(vec![
             Span::styled("▍", Style::default().fg(palette.bad)),
-            Span::styled(" 删除会话 ", Style::default().fg(palette.text)),
+            Span::styled(
+                if deleting_workspace {
+                    " 删除工作区 "
+                } else {
+                    " 删除会话 "
+                },
+                Style::default().fg(palette.text),
+            ),
         ]))
         .border_style(Style::default().fg(palette.bad));
     let inner = block.inner(popup);
@@ -493,19 +753,21 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect, palette: Palette) {
                 .fg(palette.accent)
                 .add_modifier(Modifier::BOLD),
         )),
-        Line::from("  ↑ ↓ / k j         选择会话"),
+        Line::from("  ↑ ↓ / k j         选择"),
         Line::from("  PgUp / PgDn       翻 10 行"),
         Line::from("  Home / End        跳到首尾"),
-        Line::from("  空格              勾选 / 取消勾选并下移"),
+        Line::from("  空格              勾选 / 取消勾选并下移（会话视图）"),
         Line::from("  a                 全选当前视图 / 取消全选"),
-        Line::from("  d                 删除（有勾选删勾选，否则删当前）"),
+        Line::from("  d                 删除（会话：有勾选删勾选；工作区：删整个工作区）"),
+        Line::from("  w                 切换会话 / 工作区视图"),
+        Line::from("  Enter / l         在工作区视图里查看该工作区的会话"),
         Line::from("  Tab / Shift+Tab   切换客户端视图"),
-        Line::from("  /                 按标题、ID、目录过滤"),
+        Line::from("  /                 按标题、ID、目录、工作区过滤"),
         Line::from("  J / K（详情）     滚动详情（PgUp/PgDn 也行）"),
         Line::from("  r                 立即重新扫描"),
         Line::from("  t                 切换主题"),
         Line::from("  ?                 显示 / 隐藏本帮助"),
-        Line::from("  q / Esc           退出（有过滤时先清除）"),
+        Line::from("  q / Esc           退出（先清工作区过滤，再清关键字）"),
         Line::from(""),
         Line::from(Span::styled(
             "扫描位置",
@@ -544,7 +806,15 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect, palette: Palette) {
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "删除语义：DSH 删除会话目录（占用锁时跳过）；Codex 删除 rollout 文件并清理索引；",
+        "工作区：DSH 读 workspace.json 登记并按会话 ID 归属；Codex 按会话 cwd 推断；",
+        Style::default().fg(palette.dim),
+    )));
+    lines.push(Line::from(Span::styled(
+        "Opencode 读 project 表。工作区删除只清会话存储与登记，不动项目目录。",
+        Style::default().fg(palette.dim),
+    )));
+    lines.push(Line::from(Span::styled(
+        "会话删除语义：DSH 删除会话目录（占用锁时跳过）；Codex 删除 rollout 文件并清理索引；",
         Style::default().fg(palette.dim),
     )));
     lines.push(Line::from(Span::styled(
@@ -673,9 +943,9 @@ mod tests {
 #[cfg(test)]
 mod render_tests {
     use super::*;
-    use crate::app::{App, Confirm, NoticeKind};
+    use crate::app::{App, Confirm, ConfirmTarget, NoticeKind, View};
     use crate::config::Config;
-    use crate::model::{Client, Session};
+    use crate::model::{Client, Session, Workspace};
     use crate::scan::{Root, Snapshot};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -691,6 +961,7 @@ mod render_tests {
             path: PathBuf::from(format!("/tmp/{id}")),
             root: PathBuf::from("/tmp"),
             cwd: Some("/workspace/projects".to_string()),
+            workspace: None,
             created: Some(SystemTime::now() - Duration::from_secs(7200)),
             updated: Some(SystemTime::now() - Duration::from_secs(60)),
             bytes: 1_048_576,
@@ -701,6 +972,16 @@ mod render_tests {
         }
     }
 
+    fn workspace(client: Client, id: &str, path: &str, title: &str) -> Workspace {
+        Workspace {
+            client,
+            id: id.to_string(),
+            path: path.to_string(),
+            title: title.to_string(),
+            root: PathBuf::from("/tmp"),
+        }
+    }
+
     fn sample_app() -> App {
         let mut codex = session(
             Client::Codex,
@@ -708,11 +989,25 @@ mod render_tests {
             "这是一个很长很长的标题，用来观察列表里的截断行为是否正常",
         );
         codex.locked = true;
+        let mut dsh = session(Client::Dsh, "dsh-1", "清理 DSH 会话");
+        dsh.workspace = Some(workspace(
+            Client::Dsh,
+            "ws-1",
+            "/workspace/projects",
+            "projects",
+        ));
+        let mut oc = session(Client::Opencode, "oc-1", "验证 OpenCode 接入");
+        oc.workspace = Some(workspace(
+            Client::Opencode,
+            "proj-1",
+            "/workspace/projects",
+            "projects",
+        ));
         let snapshot = Snapshot {
-            sessions: vec![
-                session(Client::Dsh, "dsh-1", "清理 DSH 会话"),
-                session(Client::Opencode, "oc-1", "验证 OpenCode 接入"),
-                codex,
+            sessions: vec![dsh, oc, codex],
+            workspaces: vec![
+                workspace(Client::Dsh, "ws-1", "/workspace/projects", "projects"),
+                workspace(Client::Dsh, "ws-empty", "/workspace/empty", "empty"),
             ],
             roots: vec![Root {
                 client: Client::Dsh,
@@ -764,6 +1059,7 @@ mod render_tests {
         assert!(text.contains("清理 DSH 会话"), "{text}");
         assert!(text.contains("验证 OpenCode 接入"), "{text}");
         assert!(text.contains("存储位置"), "{text}");
+        assert!(text.contains("工作区"), "{text}");
         assert!(text.contains("首条消息"), "{text}");
         assert!(text.contains("空格"), "{text}");
     }
@@ -780,7 +1076,7 @@ mod render_tests {
     fn renders_confirm_modal() {
         let mut app = sample_app();
         app.modal = Some(Confirm {
-            indices: vec![0, 1, 2],
+            target: ConfirmTarget::Sessions(vec![0, 1, 2]),
             dry_run: false,
         });
         let text = render(&mut app, 100, 30);
@@ -791,12 +1087,34 @@ mod render_tests {
     }
 
     #[test]
+    fn renders_workspace_view_and_confirm() {
+        let mut app = sample_app();
+        app.view = View::Workspaces;
+        app.rebuild_rows();
+        let text = render(&mut app, 120, 34);
+        assert!(text.contains("工作区"), "{text}");
+        assert!(text.contains("projects"), "{text}");
+        assert!(text.contains("empty"), "{text}");
+        assert!(text.contains("Enter 查看该工作区的会话"), "{text}");
+
+        app.modal = Some(Confirm {
+            target: ConfirmTarget::Workspace("dsh:ws-1".to_string()),
+            dry_run: false,
+        });
+        let text = render(&mut app, 120, 34);
+        assert!(text.contains("删除工作区"), "{text}");
+        assert!(text.contains("将删除工作区"), "{text}");
+        assert!(text.contains("项目目录不受影响"), "{text}");
+    }
+
+    #[test]
     fn renders_help_and_filter() {
         let mut app = sample_app();
         app.show_help = true;
         let text = render(&mut app, 110, 40);
         assert!(text.contains("扫描位置"), "{text}");
-        assert!(text.contains("按标题、ID、目录过滤"), "{text}");
+        assert!(text.contains("按标题、ID、目录、工作区过滤"), "{text}");
+        assert!(text.contains("切换会话 / 工作区视图"), "{text}");
 
         let mut app = sample_app();
         app.filter = "opencode".to_string();

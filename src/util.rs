@@ -146,6 +146,19 @@ pub fn one_line(text: &str) -> String {
     out.trim().to_string()
 }
 
+/// 目录路径的显示名：取最后一段；根目录保持 `/`。
+pub fn path_title(path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return "(未知路径)".into();
+    }
+    let trimmed = trimmed.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/".into();
+    }
+    trimmed.rsplit('/').next().unwrap_or(trimmed).to_string()
+}
+
 /// 目录占用（只统计一层文件，会话目录不会嵌套很深）。
 pub fn dir_size(path: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(path) else {
@@ -203,5 +216,13 @@ mod tests {
     #[test]
     fn collapses_whitespace() {
         assert_eq!(one_line("a\n\n  b\t c "), "a b c");
+    }
+
+    #[test]
+    fn derives_path_title() {
+        assert_eq!(path_title("/home/user/projects"), "projects");
+        assert_eq!(path_title("/home/user/projects/"), "projects");
+        assert_eq!(path_title("/"), "/");
+        assert_eq!(path_title(""), "(未知路径)");
     }
 }

@@ -11,7 +11,7 @@ use ratatui::layout::Rect;
 
 use crate::config::Config;
 use crate::delete;
-use crate::model::{Client, Session};
+use crate::model::{self, Client, Session, Workspace, WorkspaceGroup};
 use crate::scan::{self, Root};
 use crate::theme::Palette;
 use crate::util;
@@ -39,23 +39,51 @@ impl Default for Notice {
     }
 }
 
+/// 主视图：会话列表，或按工作区聚合的列表。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum View {
+    Sessions,
+    Workspaces,
+}
+
+impl View {
+    pub fn is_workspaces(self) -> bool {
+        self == View::Workspaces
+    }
+}
+
+/// 删除确认框的目标：若干会话，或一整个工作区。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfirmTarget {
+    Sessions(Vec<usize>),
+    Workspace(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct Confirm {
-    pub indices: Vec<usize>,
+    pub target: ConfirmTarget,
     pub dry_run: bool,
 }
 
 pub struct App {
     pub sessions: Vec<Session>,
+    /// 扫描到的工作区登记项，包含还没有会话的。
+    pub known_workspaces: Vec<Workspace>,
+    /// 按当前视图与过滤条件聚合出的工作区行。
+    pub workspaces: Vec<WorkspaceGroup>,
     pub roots: Vec<Root>,
     pub warnings: Vec<String>,
     /// 过滤后可见的会话下标，顺序即列表顺序。
     pub rows: Vec<usize>,
     pub selected: usize,
+    pub workspace_selected: usize,
     pub marked: BTreeSet<String>,
     pub filter: String,
     pub filter_editing: bool,
+    /// 只显示某个工作区下的会话；由工作区视图按 Enter 设置。
+    pub workspace_filter: Option<String>,
     pub client_filter: Option<Client>,
+    pub view: View,
     pub modal: Option<Confirm>,
     pub show_help: bool,
     pub help_scroll: u16,
@@ -68,6 +96,7 @@ pub struct App {
     pub quitting: bool,
     pub list_area: Rect,
     pub list_offset: usize,
+    pub workspace_list_offset: usize,
     last_scan: Instant,
 }
 
@@ -80,14 +109,19 @@ impl App {
         let palette = Palette::from_name(&config.theme);
         let mut app = Self {
             sessions: snapshot.sessions,
+            known_workspaces: snapshot.workspaces,
+            workspaces: Vec::new(),
             roots: snapshot.roots,
             warnings: snapshot.warnings,
             rows: Vec::new(),
             selected: 0,
+            workspace_selected: 0,
             marked: BTreeSet::new(),
             filter: String::new(),
             filter_editing: false,
+            workspace_filter: None,
             client_filter: None,
+            view: View::Sessions,
             modal: None,
             show_help: false,
             help_scroll: 0,
@@ -100,18 +134,25 @@ impl App {
             quitting: false,
             list_area: Rect::default(),
             list_offset: 0,
+            workspace_list_offset: 0,
             last_scan: Instant::now(),
         };
         app.rebuild_rows();
         let total = app.sessions.len();
+        let workspaces = app.workspaces.len();
         let warnings = app.warnings.len();
         if warnings > 0 {
             app.set_notice(
                 NoticeKind::Warn,
-                format!("{total} 个会话 · {warnings} 条扫描警告（? 查看帮助）"),
+                format!(
+                    "{total} 个会话 · {workspaces} 个工作区 · {warnings} 条扫描警告（? 查看帮助）"
+                ),
             );
         } else {
-            app.set_notice(NoticeKind::Info, format!("{total} 个会话 · 就绪"));
+            app.set_notice(
+                NoticeKind::Info,
+                format!("{total} 个会话 · {workspaces} 个工作区 · 就绪"),
+            );
         }
         app
     }
@@ -124,23 +165,42 @@ impl App {
     }
 
     pub fn reload(&mut self) {
+        // 先记下当前选中项，重扫后按会话标识恢复；删除会让下标整体错位。
+        let previous = self.current().map(|session| session.key());
         let snapshot = scan::scan();
         self.sessions = snapshot.sessions;
+        self.known_workspaces = snapshot.workspaces;
         self.roots = snapshot.roots;
         self.warnings = snapshot.warnings;
+        // 勾选集合里可能还留着刚被删掉的会话。
+        let existing: BTreeSet<String> = self.sessions.iter().map(Session::key).collect();
+        self.marked.retain(|key| existing.contains(key));
         self.rebuild_rows();
+        if let Some(key) = previous
+            && let Some(position) = self
+                .rows
+                .iter()
+                .position(|index| self.sessions[*index].key() == key)
+        {
+            self.selected = position;
+        }
         self.last_scan = Instant::now();
         self.dirty = true;
     }
 
-    /// 依据过滤条件重建可见行，尽量保持当前选中项不变。
+    /// 依据过滤条件重建工作区与会话行，尽量保持选中项不变。
     pub fn rebuild_rows(&mut self) {
+        self.rebuild_workspaces();
+
+        // rows 可能来自上一轮扫描（会话已被删除），下标要当成不可信输入。
         let previous = self
             .rows
             .get(self.selected)
-            .map(|index| self.sessions[*index].key());
+            .and_then(|index| self.sessions.get(*index))
+            .map(|session| session.key());
         let filter = self.filter.trim().to_lowercase();
         let client = self.client_filter;
+        let workspace_key = self.workspace_filter.clone();
         self.rows = self
             .sessions
             .iter()
@@ -151,14 +211,24 @@ impl App {
                 {
                     return false;
                 }
+                if let Some(key) = &workspace_key
+                    && &session.workspace_group_key() != key
+                {
+                    return false;
+                }
                 if filter.is_empty() {
                     return true;
                 }
                 let haystack = format!(
-                    "{} {} {} {}",
+                    "{} {} {} {} {}",
                     session.title,
                     session.id,
                     session.cwd.clone().unwrap_or_default(),
+                    session
+                        .workspace
+                        .as_ref()
+                        .map(|w| w.path.as_str())
+                        .unwrap_or(""),
                     session.client.label()
                 )
                 .to_lowercase();
@@ -178,10 +248,54 @@ impl App {
         }
     }
 
+    /// 聚合工作区行，并应用客户端与关键字过滤。
+    pub fn rebuild_workspaces(&mut self) {
+        let previous = self
+            .workspaces
+            .get(self.workspace_selected)
+            .map(|group| group.key.clone());
+        let client = self.client_filter;
+        let filter = self.filter.trim().to_lowercase();
+        self.workspaces = model::group_workspaces(&self.sessions, &self.known_workspaces);
+        self.workspaces.retain(|group| {
+            if let Some(client) = client
+                && group.client != client
+            {
+                return false;
+            }
+            filter.is_empty() || group.matches(&filter)
+        });
+        self.workspace_selected = previous
+            .and_then(|key| self.workspaces.iter().position(|group| group.key == key))
+            .unwrap_or_else(|| {
+                self.workspace_selected
+                    .min(self.workspaces.len().saturating_sub(1))
+            });
+        if self.workspaces.is_empty() {
+            self.workspace_selected = 0;
+        }
+        // 钻取中的工作区被删掉（或过滤掉）后，会话列表不再按它过滤。
+        if let Some(key) = &self.workspace_filter
+            && !self.workspaces.iter().any(|group| &group.key == key)
+        {
+            self.workspace_filter = None;
+        }
+    }
+
     pub fn current(&self) -> Option<&Session> {
         self.rows
             .get(self.selected)
-            .map(|index| &self.sessions[*index])
+            .and_then(|index| self.sessions.get(*index))
+    }
+
+    pub fn current_workspace(&self) -> Option<&WorkspaceGroup> {
+        self.workspaces.get(self.workspace_selected)
+    }
+
+    /// 会话视图正在钻取的某个工作区。
+    pub fn filtered_workspace(&self) -> Option<&WorkspaceGroup> {
+        let key = self.workspace_filter.as_ref()?;
+        self.workspaces.iter().find(|group| &group.key == key)
     }
 
     pub fn marked_count(&self) -> usize {
@@ -196,6 +310,30 @@ impl App {
             .sum()
     }
 
+    /// 确认框里要展示的会话。
+    pub fn confirm_sessions(&self, target: &ConfirmTarget) -> Vec<&Session> {
+        let indices: Vec<usize> = match target {
+            ConfirmTarget::Sessions(indices) => indices.clone(),
+            ConfirmTarget::Workspace(key) => self
+                .workspaces
+                .iter()
+                .find(|group| &group.key == key)
+                .map(|group| group.indices.clone())
+                .unwrap_or_default(),
+        };
+        indices
+            .iter()
+            .filter_map(|index| self.sessions.get(*index))
+            .collect()
+    }
+
+    pub fn confirm_workspace(&self, target: &ConfirmTarget) -> Option<&WorkspaceGroup> {
+        match target {
+            ConfirmTarget::Workspace(key) => self.workspaces.iter().find(|group| &group.key == key),
+            ConfirmTarget::Sessions(_) => None,
+        }
+    }
+
     /// 删除目标：有勾选就删勾选，否则删当前行。
     fn delete_indices(&self) -> Vec<usize> {
         if self.marked.is_empty() {
@@ -204,7 +342,11 @@ impl App {
         self.rows
             .iter()
             .copied()
-            .filter(|index| self.marked.contains(&self.sessions[*index].key()))
+            .filter(|index| {
+                self.sessions
+                    .get(*index)
+                    .is_some_and(|session| self.marked.contains(&session.key()))
+            })
             .collect()
     }
 
@@ -216,6 +358,18 @@ impl App {
         let next = (self.selected as isize + delta).clamp(0, len - 1);
         if next as usize != self.selected {
             self.selected = next as usize;
+            self.detail_scroll = 0;
+        }
+    }
+
+    fn move_workspace_by(&mut self, delta: isize) {
+        if self.workspaces.is_empty() {
+            return;
+        }
+        let len = self.workspaces.len() as isize;
+        let next = (self.workspace_selected as isize + delta).clamp(0, len - 1);
+        if next as usize != self.workspace_selected {
+            self.workspace_selected = next as usize;
             self.detail_scroll = 0;
         }
     }
@@ -258,11 +412,32 @@ impl App {
         }
         if self.config.confirm_delete {
             self.modal = Some(Confirm {
-                indices,
+                target: ConfirmTarget::Sessions(indices),
                 dry_run: false,
             });
         } else {
             self.apply_delete(indices, false);
+        }
+        self.dirty = true;
+    }
+
+    fn request_workspace_delete(&mut self) {
+        let Some(group) = self.current_workspace() else {
+            self.set_notice(NoticeKind::Warn, "没有选中的工作区");
+            return;
+        };
+        if group.indices.is_empty() && group.workspace.is_none() {
+            self.set_notice(NoticeKind::Warn, "这个工作区没有可删除的会话");
+            return;
+        }
+        let key = group.key.clone();
+        if self.config.confirm_delete {
+            self.modal = Some(Confirm {
+                target: ConfirmTarget::Workspace(key),
+                dry_run: false,
+            });
+        } else {
+            self.apply_workspace_delete(&key, false);
         }
         self.dirty = true;
     }
@@ -313,6 +488,97 @@ impl App {
         self.detail_scroll = 0;
     }
 
+    fn apply_workspace_delete(&mut self, key: &str, dry_run: bool) {
+        let Some(group) = self
+            .workspaces
+            .iter()
+            .find(|group| group.key == key)
+            .cloned()
+        else {
+            self.set_notice(NoticeKind::Warn, "工作区已不存在，请重新扫描");
+            return;
+        };
+        let sessions: Vec<Session> = group
+            .indices
+            .iter()
+            .filter_map(|index| self.sessions.get(*index).cloned())
+            .collect();
+        let report = delete::delete_workspace(&sessions, group.workspace.as_ref(), dry_run);
+        if dry_run {
+            self.set_notice(
+                NoticeKind::Warn,
+                format!(
+                    "演练：将删除工作区「{}」的 {} 个会话，释放 {}",
+                    group.title(),
+                    report.deleted,
+                    util::human_bytes(report.bytes)
+                ),
+            );
+            return;
+        }
+        for session in &sessions {
+            self.marked.remove(&session.key());
+        }
+        self.reload();
+        if report.failed() {
+            let first = report.errors.first().cloned().unwrap_or_default();
+            self.set_notice(
+                NoticeKind::Bad,
+                format!(
+                    "「{}」已删除 {} 个会话，{} 个未处理 · {first}",
+                    group.title(),
+                    report.deleted,
+                    report.skipped
+                ),
+            );
+        } else {
+            let mut text = format!(
+                "已删除工作区「{}」· {} 个会话 · {}",
+                group.title(),
+                report.deleted,
+                util::human_bytes(report.bytes)
+            );
+            if report.deregistered {
+                text.push_str(" · 已移除登记");
+            }
+            self.set_notice(NoticeKind::Ok, text);
+        }
+        self.detail_scroll = 0;
+    }
+
+    fn toggle_view(&mut self) {
+        self.view = match self.view {
+            View::Sessions => View::Workspaces,
+            View::Workspaces => View::Sessions,
+        };
+        self.detail_scroll = 0;
+        self.dirty = true;
+        let text = match self.view {
+            View::Sessions => "视图：会话",
+            View::Workspaces => "视图：工作区（Enter 查看会话，d 删除工作区）",
+        };
+        self.set_notice(NoticeKind::Info, text);
+    }
+
+    /// 从工作区视图钻取：只看这个工作区下的会话。
+    fn drill_workspace(&mut self) {
+        let Some(group) = self.current_workspace() else {
+            return;
+        };
+        let key = group.key.clone();
+        let title = group.title().to_string();
+        let count = group.count();
+        self.workspace_filter = Some(key);
+        self.view = View::Sessions;
+        self.selected = 0;
+        self.rebuild_rows();
+        self.detail_scroll = 0;
+        self.set_notice(
+            NoticeKind::Info,
+            format!("工作区「{title}」· {count} 个会话（Esc 清除工作区过滤）"),
+        );
+    }
+
     pub fn on_key(&mut self, key: KeyEvent) {
         self.dirty = true;
         if key.kind != KeyEventKind::Press {
@@ -348,35 +614,11 @@ impl App {
 
         match key.code {
             KeyCode::Char('q') => self.quitting = true,
-            KeyCode::Esc => {
-                if !self.filter.is_empty() {
-                    self.filter.clear();
-                    self.rebuild_rows();
-                } else {
-                    self.quitting = true;
-                }
-            }
+            KeyCode::Esc => self.on_escape(),
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.quitting = true
             }
-            KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
-            KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
-            KeyCode::PageDown => self.move_by(10),
-            KeyCode::PageUp => self.move_by(-10),
-            KeyCode::Home => {
-                self.selected = 0;
-                self.detail_scroll = 0;
-            }
-            KeyCode::End => {
-                self.selected = self.rows.len().saturating_sub(1);
-                self.detail_scroll = 0;
-            }
-            KeyCode::Char(' ') => self.toggle_mark(),
-            KeyCode::Char('a') => self.mark_all(),
-            KeyCode::Char('d') => self.request_delete(),
-            KeyCode::Tab => {
-                self.cycle_client(1);
-            }
+            KeyCode::Tab => self.cycle_client(1),
             KeyCode::BackTab => self.cycle_client(-1),
             KeyCode::Char('/') => {
                 self.filter_editing = true;
@@ -398,8 +640,78 @@ impl App {
                 self.show_help = true;
                 self.help_scroll = 0;
             }
+            KeyCode::Char('w') => self.toggle_view(),
             KeyCode::Char('J') => self.detail_scroll = self.detail_scroll.saturating_add(1),
             KeyCode::Char('K') => self.detail_scroll = self.detail_scroll.saturating_sub(1),
+            _ => match self.view {
+                View::Sessions => self.on_sessions_key(key),
+                View::Workspaces => self.on_workspaces_key(key),
+            },
+        }
+    }
+
+    fn on_escape(&mut self) {
+        match self.view {
+            View::Workspaces => {
+                if !self.filter.is_empty() {
+                    self.filter.clear();
+                    self.rebuild_rows();
+                } else {
+                    self.view = View::Sessions;
+                    self.detail_scroll = 0;
+                }
+            }
+            View::Sessions => {
+                if self.workspace_filter.take().is_some() {
+                    self.rebuild_rows();
+                    self.set_notice(NoticeKind::Info, "已清除工作区过滤");
+                } else if !self.filter.is_empty() {
+                    self.filter.clear();
+                    self.rebuild_rows();
+                } else {
+                    self.quitting = true;
+                }
+            }
+        }
+    }
+
+    fn on_sessions_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.move_by(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_by(-1),
+            KeyCode::PageDown => self.move_by(10),
+            KeyCode::PageUp => self.move_by(-10),
+            KeyCode::Home => {
+                self.selected = 0;
+                self.detail_scroll = 0;
+            }
+            KeyCode::End => {
+                self.selected = self.rows.len().saturating_sub(1);
+                self.detail_scroll = 0;
+            }
+            KeyCode::Char(' ') => self.toggle_mark(),
+            KeyCode::Char('a') => self.mark_all(),
+            KeyCode::Char('d') => self.request_delete(),
+            _ => {}
+        }
+    }
+
+    fn on_workspaces_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.move_workspace_by(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_workspace_by(-1),
+            KeyCode::PageDown => self.move_workspace_by(10),
+            KeyCode::PageUp => self.move_workspace_by(-10),
+            KeyCode::Home => {
+                self.workspace_selected = 0;
+                self.detail_scroll = 0;
+            }
+            KeyCode::End => {
+                self.workspace_selected = self.workspaces.len().saturating_sub(1);
+                self.detail_scroll = 0;
+            }
+            KeyCode::Enter | KeyCode::Char('l') => self.drill_workspace(),
+            KeyCode::Char('d') => self.request_workspace_delete(),
             _ => {}
         }
     }
@@ -410,7 +722,11 @@ impl App {
                 self.filter_editing = false;
                 self.rebuild_rows();
                 let count = self.rows.len();
-                self.set_notice(NoticeKind::Info, format!("过滤后 {count} 个会话"));
+                let workspaces = self.workspaces.len();
+                self.set_notice(
+                    NoticeKind::Info,
+                    format!("过滤后 {count} 个会话 · {workspaces} 个工作区"),
+                );
             }
             KeyCode::Esc => {
                 self.filter_editing = false;
@@ -440,7 +756,12 @@ impl App {
         match key.code {
             KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
                 self.modal = None;
-                self.apply_delete(modal.indices, modal.dry_run);
+                match modal.target {
+                    ConfirmTarget::Sessions(indices) => self.apply_delete(indices, modal.dry_run),
+                    ConfirmTarget::Workspace(key) => {
+                        self.apply_workspace_delete(&key, modal.dry_run)
+                    }
+                }
             }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') => {
                 self.modal = None;
@@ -486,9 +807,20 @@ impl App {
                 if !inside {
                     return;
                 }
-                let row = (mouse.row - area.y - 1) as usize + self.list_offset;
-                if row < self.rows.len() {
-                    self.selected = row;
+                let offset = match self.view {
+                    View::Sessions => self.list_offset,
+                    View::Workspaces => self.workspace_list_offset,
+                };
+                let len = match self.view {
+                    View::Sessions => self.rows.len(),
+                    View::Workspaces => self.workspaces.len(),
+                };
+                let row = (mouse.row - area.y - 1) as usize + offset;
+                if row < len {
+                    match self.view {
+                        View::Sessions => self.selected = row,
+                        View::Workspaces => self.workspace_selected = row,
+                    }
                     self.detail_scroll = 0;
                     self.dirty = true;
                 }
@@ -570,14 +902,19 @@ mod tests {
     fn app_with(sessions: Vec<Session>) -> App {
         let mut app = App {
             sessions,
+            known_workspaces: Vec::new(),
+            workspaces: Vec::new(),
             roots: Vec::new(),
             warnings: Vec::new(),
             rows: Vec::new(),
             selected: 0,
+            workspace_selected: 0,
             marked: BTreeSet::new(),
             filter: String::new(),
             filter_editing: false,
+            workspace_filter: None,
             client_filter: None,
+            view: View::Sessions,
             modal: None,
             show_help: false,
             help_scroll: 0,
@@ -590,6 +927,7 @@ mod tests {
             quitting: false,
             list_area: Rect::default(),
             list_offset: 0,
+            workspace_list_offset: 0,
             last_scan: Instant::now(),
         };
         app.rebuild_rows();
@@ -605,6 +943,7 @@ mod tests {
             path: "/tmp/x".into(),
             root: "/tmp".into(),
             cwd: None,
+            workspace: None,
             created: None,
             updated: None,
             bytes: 1024,
@@ -613,6 +952,17 @@ mod tests {
             cost: None,
             locked: false,
         }
+    }
+
+    fn in_workspace(mut session: Session, id: &str, path: &str) -> Session {
+        session.workspace = Some(Workspace {
+            client: session.client,
+            id: id.to_string(),
+            path: path.to_string(),
+            title: util::path_title(path),
+            root: "/tmp".into(),
+        });
+        session
     }
 
     #[test]
@@ -656,7 +1006,7 @@ mod tests {
         assert_eq!(app.marked_count(), 1);
         press(&mut app, KeyCode::Char('d'));
         let modal = app.modal.as_ref().expect("确认框应打开");
-        assert_eq!(modal.indices, vec![0]);
+        assert_eq!(modal.target, ConfirmTarget::Sessions(vec![0]));
         press(&mut app, KeyCode::Esc);
         assert!(app.modal.is_none());
         assert!(!app.quitting);
@@ -670,7 +1020,24 @@ mod tests {
         ]);
         press(&mut app, KeyCode::Char('j'));
         press(&mut app, KeyCode::Char('d'));
-        assert_eq!(app.modal.as_ref().expect("确认框应打开").indices, vec![1]);
+        assert_eq!(
+            app.modal.as_ref().expect("确认框应打开").target,
+            ConfirmTarget::Sessions(vec![1])
+        );
+    }
+
+    #[test]
+    fn shrinking_session_list_does_not_break_selection() {
+        // 删除会话后重扫会拿到更短的列表，旧 rows 里的下标已经失效。
+        let mut app = app_with(vec![
+            session(Client::Dsh, "a", "A"),
+            session(Client::Dsh, "b", "B"),
+        ]);
+        app.selected = 1;
+        app.sessions.remove(0);
+        app.rebuild_rows();
+        assert_eq!(app.rows, vec![0]);
+        assert_eq!(app.current().expect("仍应选中剩下的会话").id, "b");
     }
 
     #[test]
@@ -707,5 +1074,72 @@ mod tests {
         assert_eq!(app.client_filter, None);
         app.cycle_client(-1);
         assert_eq!(app.client_filter, Some(Client::Opencode));
+    }
+
+    #[test]
+    fn workspace_view_groups_and_drills_in() {
+        let mut app = app_with(vec![
+            in_workspace(session(Client::Dsh, "a", "A"), "ws-1", "/work/alpha"),
+            in_workspace(session(Client::Dsh, "b", "B"), "ws-1", "/work/alpha"),
+            in_workspace(
+                session(Client::Codex, "c", "C"),
+                "path:/work/beta",
+                "/work/beta",
+            ),
+        ]);
+        press(&mut app, KeyCode::Char('w'));
+        assert_eq!(app.view, View::Workspaces);
+        assert_eq!(app.workspaces.len(), 2);
+        assert_eq!(app.current_workspace().map(WorkspaceGroup::count), Some(2));
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.view, View::Sessions);
+        assert_eq!(app.rows.len(), 2, "只保留这个工作区的会话");
+        assert_eq!(app.workspace_filter.as_deref(), Some("dsh:ws-1"));
+
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.workspace_filter, None);
+        assert_eq!(app.rows.len(), 3);
+        assert!(!app.quitting);
+    }
+
+    #[test]
+    fn escape_in_workspace_view_returns_to_sessions() {
+        let mut app = app_with(vec![session(Client::Dsh, "a", "A")]);
+        press(&mut app, KeyCode::Char('w'));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.view, View::Sessions);
+        assert!(!app.quitting);
+    }
+
+    #[test]
+    fn workspace_delete_opens_confirm() {
+        let mut app = app_with(vec![
+            in_workspace(session(Client::Dsh, "a", "A"), "ws-1", "/work/alpha"),
+            in_workspace(session(Client::Dsh, "b", "B"), "ws-1", "/work/alpha"),
+        ]);
+        press(&mut app, KeyCode::Char('w'));
+        press(&mut app, KeyCode::Char('d'));
+        let modal = app.modal.as_ref().expect("确认框应打开");
+        assert_eq!(modal.target, ConfirmTarget::Workspace("dsh:ws-1".into()));
+        assert_eq!(app.confirm_sessions(&modal.target).len(), 2);
+        assert!(app.confirm_workspace(&modal.target).is_some());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn empty_registered_workspace_shows_up() {
+        let mut app = app_with(Vec::new());
+        app.known_workspaces.push(Workspace {
+            client: Client::Dsh,
+            id: "ws-empty".into(),
+            path: "/work/empty".into(),
+            title: "Empty".into(),
+            root: "/tmp".into(),
+        });
+        app.rebuild_rows();
+        assert_eq!(app.workspaces.len(), 1);
+        assert_eq!(app.workspaces[0].count(), 0);
     }
 }

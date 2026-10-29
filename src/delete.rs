@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use crate::model::{Client, Session};
+use crate::model::{Client, Session, Workspace};
 use crate::util;
 
 pub struct Report {
@@ -79,6 +79,7 @@ fn delete_dsh(session: &Session) -> Result<u64> {
     }
     let bytes = util::dir_size(dir);
     fs::remove_dir_all(dir).with_context(|| format!("删除 {}", dir.display()))?;
+    drop_dsh_projcache(&session.root, &session.id);
     // 工作区目录空了就一并收掉，避免残留空壳。
     if let Some(parent) = dir.parent()
         && let Ok(mut entries) = fs::read_dir(parent)
@@ -162,6 +163,220 @@ fn delete_opencode(session: &Session) -> Result<u64> {
         bail!("数据库里没有该会话，可能已被删除");
     }
     Ok(session.bytes)
+}
+
+/// 删除整个工作区：先逐个删会话，全部成功后再注销工作区登记。
+///
+/// 只清理会话存储与登记项，**不会**碰工作区目录本身里的项目文件。
+pub struct WorkspaceReport {
+    pub deleted: usize,
+    pub bytes: u64,
+    /// 因为锁或路径校验被跳过的会话数。
+    pub skipped: usize,
+    pub errors: Vec<String>,
+    /// 是否把登记项（DSH 的 workspace.json、Opencode 的 project 行）也移除了。
+    pub deregistered: bool,
+}
+
+impl WorkspaceReport {
+    pub fn failed(&self) -> bool {
+        !self.errors.is_empty()
+    }
+}
+
+pub fn delete_workspace(
+    sessions: &[Session],
+    workspace: Option<&Workspace>,
+    dry_run: bool,
+) -> WorkspaceReport {
+    let mut report = WorkspaceReport {
+        deleted: 0,
+        bytes: 0,
+        skipped: 0,
+        errors: Vec::new(),
+        deregistered: false,
+    };
+    for session in sessions {
+        let outcome = if dry_run {
+            Ok(session.bytes)
+        } else {
+            delete(session)
+        };
+        match outcome {
+            Ok(bytes) => {
+                report.deleted += 1;
+                report.bytes += bytes;
+            }
+            Err(error) => {
+                report.skipped += 1;
+                report.errors.push(format!(
+                    "{} · {}：{error}",
+                    session.client.label(),
+                    util::truncate(&session.title, 40)
+                ));
+            }
+        }
+    }
+    if dry_run || report.failed() {
+        return report;
+    }
+    let Some(workspace) = workspace else {
+        return report;
+    };
+    let outcome = match workspace.client {
+        Client::Dsh => deregister_dsh_workspace(&workspace.root, &workspace.id),
+        Client::Opencode => deregister_opencode_project(&workspace.root, &workspace.id),
+        // Codex 没有工作区登记表，删掉 rollout 文件就等于工作区里没有会话了。
+        Client::Codex => Ok(false),
+    };
+    match outcome {
+        Ok(removed) => report.deregistered = removed,
+        Err(error) => report.errors.push(format!("注销工作区失败：{error:#}")),
+    }
+    report
+}
+
+/// DSH 为每个会话缓存一份渲染状态，删会话后一并清掉，避免留下孤儿文件。
+fn drop_dsh_projcache(root: &Path, id: &str) {
+    let cache = root
+        .join("storages")
+        .join("session_projcache")
+        .join("sessions")
+        .join(format!("{id}.json"));
+    let _ = fs::remove_file(cache);
+}
+
+/// 从 `storages/workspace.json` 里摘掉一个工作区，并清理指向它的全局列表。
+fn deregister_dsh_workspace(root: &Path, id: &str) -> Result<bool> {
+    let path = root.join("storages").join("workspace.json");
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let text = fs::read_to_string(&path).with_context(|| format!("读取 {}", path.display()))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("解析 {}", path.display()))?;
+
+    let session_ids = {
+        let Some(table) = value
+            .pointer_mut("/tables/workspaces")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            return Ok(false);
+        };
+        let Some(record) = table.remove(id) else {
+            return Ok(false);
+        };
+        let session_ids: Vec<String> = record
+            .get("sessionIds")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str)
+            .map(str::to_string)
+            .collect();
+        // 会话还没删干净就保留登记，避免把仍在使用中的会话变成孤儿。
+        if let Some(name) = dsh_present_session(root, &session_ids) {
+            bail!("工作区里还有会话 {name}，已保留登记");
+        }
+        session_ids
+    };
+
+    if let Some(global) = value
+        .pointer_mut("/global")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        if let Some(ids) = global
+            .get_mut("workspaceIds")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            ids.retain(|item| item.as_str() != Some(id));
+        }
+        for key in ["archivedSessionIds", "pinnedSessionIds"] {
+            if let Some(ids) = global
+                .get_mut(key)
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                ids.retain(|item| {
+                    item.as_str()
+                        .is_none_or(|item| !session_ids.iter().any(|id| id == item))
+                });
+            }
+        }
+        let default = global
+            .get("defaultWorkspaceId")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        if default.as_deref() == Some(id) {
+            let next = global
+                .get("workspaceIds")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|ids| ids.first())
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            global.insert("defaultWorkspaceId".into(), next);
+        }
+    }
+
+    write_json_atomic(&path, &value)?;
+    Ok(true)
+}
+
+/// 这些会话 id 里是否还有目录留在 `sessions/<bucket>/` 下。
+fn dsh_present_session(root: &Path, session_ids: &[String]) -> Option<String> {
+    if session_ids.is_empty() {
+        return None;
+    }
+    let entries = fs::read_dir(root.join("sessions")).ok()?;
+    for bucket in entries.flatten() {
+        let Ok(sessions) = fs::read_dir(bucket.path()) else {
+            continue;
+        };
+        for entry in sessions.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if session_ids.contains(&name) {
+                return Some(name);
+            }
+        }
+    }
+    None
+}
+
+fn deregister_opencode_project(root: &Path, project_id: &str) -> Result<bool> {
+    let db = root.join("opencode.db");
+    if !db.is_file() {
+        return Ok(false);
+    }
+    let conn = rusqlite::Connection::open(&db).with_context(|| format!("打开 {}", db.display()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(3))?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    let remaining: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM session_v2 WHERE project_id = ?1",
+        [project_id],
+        |row| row.get(0),
+    )?;
+    if remaining > 0 {
+        bail!("项目里还有 {remaining} 个会话，已保留登记");
+    }
+    let tx = conn.unchecked_transaction()?;
+    // 外键级联会带走该项目名下的会话与消息。
+    let removed = tx.execute("DELETE FROM project WHERE id = ?1", [project_id])?;
+    tx.commit()?;
+    Ok(removed > 0)
+}
+
+/// 原子写 JSON：先写临时文件再 rename，避免客户端读到半截文件。
+fn write_json_atomic(path: &Path, value: &serde_json::Value) -> Result<()> {
+    let text = serde_json::to_string_pretty(value)?;
+    let mut tmp = path.to_path_buf();
+    tmp.set_extension("json.tmp");
+    {
+        let mut file = fs::File::create(&tmp).with_context(|| format!("写入 {}", tmp.display()))?;
+        file.write_all(text.as_bytes())?;
+        file.write_all(b"\n")?;
+        file.sync_all().ok();
+    }
+    fs::rename(&tmp, path).with_context(|| format!("替换 {}", path.display()))?;
+    Ok(())
 }
 
 /// 规范化后确认 `child` 位于 `parent` 内，防止脏数据导致误删。

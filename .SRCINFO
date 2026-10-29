@@ -1,6 +1,6 @@
 pkgbase = sesstui
 	pkgdesc = Terminal UI to browse, filter and delete DeepSeek Harness, Codex and Opencode sessions
-	pkgver = 0.1.1
+	pkgver = 0.2.0
 	pkgrel = 1
 	url = https://github.com/Ricarsz/sesstui
 	arch = x86_64
@@ -11,7 +11,7 @@ pkgbase = sesstui
 	depends = glibc
 	optdepends = zstd: fallback decoder for DeepSeek Harness session logs
 	options = !lto
-	source = sesstui::git+https://github.com/Ricarsz/sesstui#tag=v0.1.1
+	source = sesstui::git+https://github.com/Ricarsz/sesstui#tag=v0.2.0
 	sha256sums = SKIP
 
 pkgname = sesstui

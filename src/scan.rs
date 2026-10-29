@@ -18,7 +18,7 @@ use std::time::SystemTime;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::model::{Client, Session};
+use crate::model::{Client, Session, Workspace};
 use crate::util;
 
 #[derive(Debug, Clone)]
@@ -32,6 +32,8 @@ pub struct Root {
 #[derive(Debug, Default)]
 pub struct Snapshot {
     pub sessions: Vec<Session>,
+    /// 扫描到的工作区，包含还没有任何会话的登记项。
+    pub workspaces: Vec<Workspace>,
     pub roots: Vec<Root>,
     pub warnings: Vec<String>,
 }
@@ -88,6 +90,7 @@ pub fn scan() -> Snapshot {
             .then_with(|| a.client.cmp(&b.client))
     });
     dedupe_storage(&mut snapshot);
+    dedupe_workspaces(&mut snapshot);
     snapshot
 }
 
@@ -123,8 +126,23 @@ fn dedupe_storage(snapshot: &mut Snapshot) {
     for session in &mut snapshot.sessions {
         if let Some(root) = root_map.get(&storage_key(session.client, &session.root)) {
             session.root = root.clone();
+            if let Some(workspace) = &mut session.workspace {
+                workspace.root = root.clone();
+            }
         }
     }
+}
+
+/// 别名根会让同一份工作区登记出现两次，按客户端 + 标识 + 规范化根去重。
+fn dedupe_workspaces(snapshot: &mut Snapshot) {
+    let mut seen = HashSet::new();
+    snapshot.workspaces.retain(|workspace| {
+        seen.insert((
+            workspace.client,
+            workspace.id.clone(),
+            canonical(&workspace.root),
+        ))
+    });
 }
 
 /// 判断两个根目录是否指向同一份存储：DSH/Codex 看 `sessions/`，Opencode 看数据库文件。
@@ -141,6 +159,82 @@ fn canonical(path: &Path) -> PathBuf {
 
 // ---------------------------------------------------------------- DSH
 
+/// DSH 的工作区登记：`<root>/storages/workspace.json` 里的 `tables.workspaces`。
+#[derive(Debug, Default)]
+struct DshWorkspaces {
+    all: Vec<Workspace>,
+    /// 会话 id → 工作区 id。
+    session_owner: HashMap<String, String>,
+}
+
+impl DshWorkspaces {
+    fn by_id(&self, id: &str) -> Option<&Workspace> {
+        self.all.iter().find(|workspace| workspace.id == id)
+    }
+
+    fn by_path(&self, path: &str) -> Option<&Workspace> {
+        self.all
+            .iter()
+            .find(|workspace| same_path(&workspace.path, path))
+    }
+}
+
+fn load_dsh_workspaces(root: &Path) -> Result<DshWorkspaces> {
+    let path = root.join("storages").join("workspace.json");
+    let text = fs::read_to_string(&path).with_context(|| format!("读取 {}", path.display()))?;
+    let value: Value =
+        serde_json::from_str(&text).with_context(|| format!("解析 {}", path.display()))?;
+    Ok(parse_dsh_workspaces(&value, root))
+}
+
+fn parse_dsh_workspaces(value: &Value, root: &Path) -> DshWorkspaces {
+    let mut out = DshWorkspaces::default();
+    let Some(table) = value
+        .pointer("/tables/workspaces")
+        .and_then(Value::as_object)
+    else {
+        return out;
+    };
+    for (id, record) in table {
+        let Some(path) = record
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+        else {
+            continue;
+        };
+        let title = record
+            .get("title")
+            .and_then(Value::as_str)
+            .map(util::one_line)
+            .filter(|title| !title.is_empty())
+            .unwrap_or_else(|| util::path_title(path));
+        for session_id in record
+            .get("sessionIds")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            out.session_owner.insert(session_id.to_string(), id.clone());
+        }
+        out.all.push(Workspace {
+            client: Client::Dsh,
+            id: id.clone(),
+            path: path.to_string(),
+            title,
+            root: root.to_path_buf(),
+        });
+    }
+    out
+}
+
+/// 比较两个目录路径，容忍结尾斜杠与 `//`。
+fn same_path(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
 fn scan_dsh(snapshot: &mut Snapshot) {
     let mut roots = env_roots("SESSTUI_DSH_ROOT");
     if roots.is_empty() {
@@ -153,6 +247,21 @@ fn scan_dsh(snapshot: &mut Snapshot) {
             path: root.clone(),
             sessions: 0,
             error: None,
+        };
+        let workspaces = match load_dsh_workspaces(&root) {
+            Ok(workspaces) => {
+                snapshot.workspaces.extend(workspaces.all.iter().cloned());
+                workspaces
+            }
+            Err(error) => {
+                // 老版本 DSH 可能还没有工作区登记，这只是少了一列信息。
+                if root.join("storages").join("workspace.json").exists() {
+                    snapshot
+                        .warnings
+                        .push(format!("{}：{error:#}", root.display()));
+                }
+                DshWorkspaces::default()
+            }
         };
         let mut entries: Vec<PathBuf> = fs::read_dir(&base)
             .map(|reads| {
@@ -173,7 +282,7 @@ fn scan_dsh(snapshot: &mut Snapshot) {
                 if !dir.is_dir() {
                     continue;
                 }
-                match load_dsh_session(&dir, &root) {
+                match load_dsh_session(&dir, &root, &workspaces) {
                     Ok(Some(session)) => {
                         root_info.sessions += 1;
                         snapshot.sessions.push(session);
@@ -189,7 +298,11 @@ fn scan_dsh(snapshot: &mut Snapshot) {
     }
 }
 
-fn load_dsh_session(dir: &Path, root: &Path) -> Result<Option<Session>> {
+fn load_dsh_session(
+    dir: &Path,
+    root: &Path,
+    workspaces: &DshWorkspaces,
+) -> Result<Option<Session>> {
     let mut files: Vec<PathBuf> = fs::read_dir(dir)
         .with_context(|| format!("读取 {}", dir.display()))?
         .flatten()
@@ -287,6 +400,19 @@ fn load_dsh_session(dir: &Path, root: &Path) -> Result<Option<Session>> {
     }
 
     let locked = util::lock_held(&dir.join("session.lock"));
+    let workspace = workspaces
+        .session_owner
+        .get(&id)
+        .and_then(|owner| workspaces.by_id(owner))
+        .or_else(|| {
+            // 登记表里没有这个会话时，按 cwd 找同名工作区，最后退回按目录合成。
+            cwd.as_deref().and_then(|cwd| workspaces.by_path(cwd))
+        })
+        .cloned()
+        .or_else(|| {
+            cwd.as_ref()
+                .map(|cwd| Workspace::from_path(Client::Dsh, cwd.clone(), root.to_path_buf()))
+        });
     let title = if title.is_empty() {
         if preview.is_empty() {
             "(无标题)".to_string()
@@ -305,6 +431,7 @@ fn load_dsh_session(dir: &Path, root: &Path) -> Result<Option<Session>> {
         path: dir.to_path_buf(),
         root: root.to_path_buf(),
         cwd,
+        workspace,
         created,
         updated,
         bytes,
@@ -597,6 +724,10 @@ fn load_codex_session(
 
     let meta = fs::metadata(file)?;
     let updated = meta.modified().ok();
+    // Codex 没有工作区登记表，用会话记录的 cwd 作为工作区。
+    let workspace = cwd
+        .as_ref()
+        .map(|cwd| Workspace::from_path(Client::Codex, cwd.clone(), root.to_path_buf()));
     let title = titles
         .get(&id)
         .cloned()
@@ -617,6 +748,7 @@ fn load_codex_session(
         path: file.to_path_buf(),
         root: root.to_path_buf(),
         cwd,
+        workspace,
         created,
         updated,
         bytes: meta.len(),
@@ -730,9 +862,10 @@ fn scan_opencode(snapshot: &mut Snapshot) {
             continue;
         }
         match load_opencode_sessions(&db, &root) {
-            Ok(sessions) => {
+            Ok((sessions, workspaces)) => {
                 root_info.sessions = sessions.len();
                 snapshot.sessions.extend(sessions);
+                snapshot.workspaces.extend(workspaces);
             }
             Err(error) => root_info.error = Some(format!("{error:#}")),
         }
@@ -740,17 +873,57 @@ fn scan_opencode(snapshot: &mut Snapshot) {
     }
 }
 
-fn load_opencode_sessions(db: &Path, root: &Path) -> Result<Vec<Session>> {
+/// Opencode 把工作区叫 `project`，单独一张表；即使还没有会话也会登记。
+fn load_opencode_projects(conn: &rusqlite::Connection, root: &Path) -> Vec<Workspace> {
+    let Ok(mut stmt) =
+        conn.prepare("SELECT id, COALESCE(worktree, ''), COALESCE(name, '') FROM project")
+    else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    }) else {
+        return Vec::new();
+    };
+    rows.flatten()
+        .filter_map(|(id, worktree, name)| {
+            let worktree = worktree.trim();
+            if worktree.is_empty() {
+                return None;
+            }
+            let title = if name.trim().is_empty() {
+                util::path_title(worktree)
+            } else {
+                util::one_line(&name)
+            };
+            Some(Workspace {
+                client: Client::Opencode,
+                id,
+                path: worktree.to_string(),
+                title,
+                root: root.to_path_buf(),
+            })
+        })
+        .collect()
+}
+
+fn load_opencode_sessions(db: &Path, root: &Path) -> Result<(Vec<Session>, Vec<Workspace>)> {
     let conn = rusqlite::Connection::open_with_flags(
         db,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .with_context(|| format!("打开 {}", db.display()))?;
+    let projects = load_opencode_projects(&conn, root);
     let mut stmt = conn.prepare(
         "SELECT s.id, COALESCE(s.title, ''), s.directory, s.time_created, s.time_updated,
                 s.tokens_input, s.tokens_output, s.cost,
                 (SELECT COUNT(*) FROM session_message m WHERE m.session_id = s.id),
-                (SELECT COALESCE(SUM(LENGTH(m.data)), 0) FROM session_message m WHERE m.session_id = s.id)
+                (SELECT COALESCE(SUM(LENGTH(m.data)), 0) FROM session_message m WHERE m.session_id = s.id),
+                COALESCE(s.project_id, '')
          FROM session_v2 s
          ORDER BY s.time_updated DESC",
     )?;
@@ -766,18 +939,41 @@ fn load_opencode_sessions(db: &Path, root: &Path) -> Result<Vec<Session>> {
             row.get::<_, f64>(7)?,
             row.get::<_, i64>(8)?,
             row.get::<_, i64>(9)?,
+            row.get::<_, String>(10)?,
         ))
     })?;
 
     let mut sessions = Vec::new();
     for row in rows {
-        let (id, title, directory, created, updated, tokens_in, tokens_out, cost, messages, bytes) =
-            row?;
+        let (
+            id,
+            title,
+            directory,
+            created,
+            updated,
+            tokens_in,
+            tokens_out,
+            cost,
+            messages,
+            bytes,
+            project_id,
+        ) = row?;
         let title = if title.trim().is_empty() {
             "(无标题)".to_string()
         } else {
             util::one_line(&title)
         };
+        let workspace = projects
+            .iter()
+            .find(|workspace| workspace.id == project_id)
+            .cloned()
+            .or_else(|| {
+                Some(Workspace::from_path(
+                    Client::Opencode,
+                    directory.clone(),
+                    root.to_path_buf(),
+                ))
+            });
         sessions.push(Session {
             client: Client::Opencode,
             id,
@@ -786,6 +982,7 @@ fn load_opencode_sessions(db: &Path, root: &Path) -> Result<Vec<Session>> {
             path: db.to_path_buf(),
             root: root.to_path_buf(),
             cwd: Some(directory),
+            workspace,
             created: util::system_time_from_millis(created),
             updated: util::system_time_from_millis(updated),
             bytes: bytes.max(0) as u64,
@@ -795,7 +992,7 @@ fn load_opencode_sessions(db: &Path, root: &Path) -> Result<Vec<Session>> {
             locked: false,
         });
     }
-    Ok(sessions)
+    Ok((sessions, projects))
 }
 
 #[cfg(test)]
@@ -833,5 +1030,38 @@ mod tests {
             }
         });
         assert!(dsh_user_text(&record).is_none());
+    }
+
+    #[test]
+    fn parses_dsh_workspace_registry() {
+        let value = serde_json::json!({
+            "tables": {
+                "workspaces": {
+                    "ws-1": {
+                        "path": "/work/projects/",
+                        "title": "Projects",
+                        "sessionIds": ["session-a", "session-b"]
+                    },
+                    "ws-2": {
+                        "path": "/work/other",
+                        "sessionIds": []
+                    }
+                }
+            }
+        });
+        let workspaces = parse_dsh_workspaces(&value, Path::new("/root"));
+        assert_eq!(workspaces.all.len(), 2);
+        assert_eq!(
+            workspaces
+                .session_owner
+                .get("session-a")
+                .map(String::as_str),
+            Some("ws-1")
+        );
+        let by_path = workspaces.by_path("/work/projects").expect("路径匹配");
+        assert_eq!(by_path.id, "ws-1");
+        assert_eq!(by_path.title, "Projects");
+        let other = workspaces.by_id("ws-2").expect("标识匹配");
+        assert_eq!(other.title, "other", "没有标题时回退到目录名");
     }
 }

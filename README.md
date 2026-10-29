@@ -2,13 +2,14 @@
 
 [![package](https://github.com/Ricarsz/sesstui/actions/workflows/package.yml/badge.svg)](https://github.com/Ricarsz/sesstui/actions/workflows/package.yml)
 
-一个终端界面，用来查看、筛选和删除本机 AI 编码客户端留下的会话：
+一个终端界面，用来查看、筛选和删除本机 AI 编码客户端留下的会话与工作区：
 
 - **DeepSeek Harness**（`~/.dsh`）
 - **Codex**（`~/.codex`，含 `CODEX_HOME` 形式的独立实例）
 - **Opencode**（`~/.local/share/opencode/opencode.db`）
 
-所有会话汇总到一个列表里，显示标题、最后更新、占用空间、消息数和是否正在使用；
+所有会话汇总到一个列表里，显示标题、所属工作区、最后更新、占用空间、消息数和是否正在使用；
+按 `w` 可以切到工作区视图，按工作区聚合查看会话，并一次性删掉整个工作区。
 支持多选删除、按客户端切换、按关键字过滤，删除前要确认，也可以只演练。
 
 ## 安装
@@ -36,8 +37,10 @@ paru -Bi .
 
 ```sh
 sesstui                 # 打开 TUI
-sesstui list            # 列出会话
+sesstui list            # 列出会话（--workspace <spec> 只看一个工作区）
+sesstui workspaces      # 列出工作区（含还没有会话的登记项）
 sesstui delete <id>     # 删除指定会话（可加 --dry-run）
+sesstui delete-workspace <spec>  # 删除整个工作区（可加 --dry-run）
 sesstui doctor          # 检查扫描位置、数据库与依赖
 sesstui paths           # 只打印扫描路径
 sesstui config --init   # 写入默认配置
@@ -45,6 +48,10 @@ sesstui config --init   # 写入默认配置
 
 `delete` 的 ID 形如 `dsh:session-<uuid>`、`codex:<uuid>`、`opencode:ses_<id>`；
 不带前缀时会在所有客户端里按 ID 匹配，匹配到多个会拒绝执行。
+
+`delete-workspace` 与 `list --workspace` 的 `<spec>` 可以是工作区标识、完整路径、
+标题或路径末段（例如 `Projects` 或 `/home/you/Projects`），也可以带 `dsh:`、`codex:`、
+`opencode:` 前缀限定客户端；匹配到多个会列出候选并拒绝执行。
 
 ### 键位
 
@@ -55,14 +62,35 @@ sesstui config --init   # 写入默认配置
 | `Home` `End` | 跳到首尾 |
 | `空格` | 勾选 / 取消勾选并下移 |
 | `a` | 全选当前视图 / 取消全选 |
-| `d` | 删除（有勾选删勾选，否则删当前） |
+| `d` | 删除（会话：有勾选删勾选；工作区：删整个工作区） |
+| `w` | 切换会话 / 工作区视图 |
+| `Enter` / `l` | 在工作区视图里钻进去，只看该工作区的会话 |
 | `Tab` / `Shift+Tab` | 切换客户端视图 |
-| `/` | 按标题、ID、目录过滤 |
+| `/` | 按标题、ID、目录、工作区过滤 |
 | `J` / `K` | 滚动右侧详情 |
 | `r` | 立即重新扫描 |
 | `t` | 切换主题 |
 | `?` | 显示 / 隐藏帮助 |
-| `q` / `Esc` | 退出（有过滤时先清除） |
+| `q` / `Esc` | 退出（先清工作区过滤，再清关键字过滤） |
+
+## 工作区
+
+会话归属哪个工作区，按各客户端自己的记录来识别：
+
+| 客户端 | 识别方式 |
+| --- | --- |
+| DeepSeek Harness | 读 `~/.dsh*/storages/workspace.json` 的登记表，用会话 ID 反查；退而用会话的 `cwd` 匹配工作区路径；再不行就按 `cwd` 现合成一个 |
+| Codex | 没有工作区表，直接按会话的 `cwd` 归并 |
+| Opencode | 读 `opencode.db` 的 `project` 表，按 `session_v2.project_id` 关联；没有会话的项目也会列出来 |
+
+识别不到工作区的会话按客户端归到「未识别工作区」一组，只能逐个删除。
+
+在 TUI 里按 `w` 切到工作区视图，`Enter` 钻进去只看该工作区的会话，`d` 删除整个工作区；
+命令行对应 `sesstui workspaces` 与 `sesstui delete-workspace <spec>`。
+
+删除工作区做两件事：删掉它名下的会话，再移除工作区登记（DeepSeek Harness 改
+`workspace.json`，Opencode 删 `project` 行）。**项目目录本身不会被删除**；只要还有会话
+没删干净（例如正被其他进程占用），登记就会保留，避免留下没有归属的会话。
 
 ## 会话存储
 
@@ -99,7 +127,8 @@ confirm_delete = true  # 删除前弹确认框
 - 删除前会把目标路径规范化，并确认它仍在对应的存储根目录内，避免误删。
 - DeepSeek Harness 会话被其他进程加锁时直接跳过，不会强删。
 - Opencode 的删除在单个事务里完成，失败会整体回滚。
-- `sesstui delete --dry-run` 只打印目标，不落盘。
+- 删除工作区只清理会话存储与登记，项目目录保持原样；有会话删不掉时保留登记。
+- `sesstui delete --dry-run` 与 `sesstui delete-workspace --dry-run` 只打印目标，不落盘。
 
 ## 限制
 

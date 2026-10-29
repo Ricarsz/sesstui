@@ -1,6 +1,6 @@
 # Maintainer: Ricarsz <Ricarsz@users.noreply.github.com>
 pkgname=sesstui
-pkgver=0.1.1
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Terminal UI to browse, filter and delete DeepSeek Harness, Codex and Opencode sessions'
 arch=('x86_64' 'aarch64')

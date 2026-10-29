@@ -1,5 +1,6 @@
 //! CLI 子命令。无子命令时由 `main` 启动 TUI。
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use anyhow::{Result, bail};
@@ -9,7 +10,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::config::Config;
 use crate::delete;
-use crate::model::{Client, Session};
+use crate::model::{self, Client, Session, WorkspaceGroup};
 use crate::scan;
 use crate::util;
 
@@ -37,6 +38,9 @@ pub enum Cmd {
         /// 只看某个客户端：dsh / codex / opencode
         #[arg(long)]
         client: Option<String>,
+        /// 只看某个工作区：标识、路径、标题或路径末段
+        #[arg(long)]
+        workspace: Option<String>,
     },
     /// 删除会话，参数形如 `dsh:session-<uuid>`、`codex:<uuid>`、`opencode:ses_<id>`
     Delete {
@@ -46,6 +50,23 @@ pub enum Cmd {
         #[arg(long)]
         dry_run: bool,
         /// 只删除某个客户端的会话
+        #[arg(long)]
+        client: Option<String>,
+    },
+    /// 列出工作区（含还没有会话的登记项）
+    Workspaces {
+        /// 只看某个客户端：dsh / codex / opencode
+        #[arg(long)]
+        client: Option<String>,
+    },
+    /// 删除整个工作区：清掉它的会话存储与登记，不动项目目录
+    DeleteWorkspace {
+        /// 工作区标识、完整路径、标题，或路径末段
+        specs: Vec<String>,
+        /// 只打印将要删除的内容
+        #[arg(long)]
+        dry_run: bool,
+        /// 只匹配某个客户端的工作区
         #[arg(long)]
         client: Option<String>,
     },
@@ -73,12 +94,18 @@ pub fn run(cli: Cli) -> Result<()> {
 
 fn dispatch(command: Cmd, json: bool) -> Result<()> {
     match command {
-        Cmd::List { client } => list(client.as_deref(), json),
+        Cmd::List { client, workspace } => list(client.as_deref(), workspace.as_deref(), json),
         Cmd::Delete {
             ids,
             dry_run,
             client,
         } => delete_cmd(&ids, dry_run, client.as_deref(), json),
+        Cmd::Workspaces { client } => workspaces_cmd(client.as_deref(), json),
+        Cmd::DeleteWorkspace {
+            specs,
+            dry_run,
+            client,
+        } => delete_workspace_cmd(&specs, dry_run, client.as_deref(), json),
         Cmd::Doctor => doctor(),
         Cmd::Paths => paths(json),
         Cmd::Config { init, force } => config_cmd(init, force, json),
@@ -98,9 +125,32 @@ fn sessions_of(client: Option<Client>) -> Vec<Session> {
         .collect()
 }
 
-fn list(client: Option<&str>, json: bool) -> Result<()> {
+/// 扫描一次并按客户端筛出工作区行。
+fn workspace_groups(snapshot: &scan::Snapshot, client: Option<Client>) -> Vec<WorkspaceGroup> {
+    let mut groups = model::group_workspaces(&snapshot.sessions, &snapshot.workspaces);
+    if let Some(client) = client {
+        groups.retain(|group| group.client == client);
+    }
+    groups
+}
+
+fn list(client: Option<&str>, workspace: Option<&str>, json: bool) -> Result<()> {
     let client = client.map(parse_client).transpose()?;
-    let sessions = sessions_of(client);
+    let snapshot = scan::scan();
+    let groups = workspace_groups(&snapshot, client);
+    let workspace = workspace
+        .map(|spec| resolve_workspace(&groups, spec))
+        .transpose()?;
+    let sessions: Vec<Session> = snapshot
+        .sessions
+        .into_iter()
+        .filter(|session| client.is_none_or(|wanted| session.client == wanted))
+        .filter(|session| {
+            workspace
+                .as_ref()
+                .is_none_or(|group| session.workspace_group_key() == group.key)
+        })
+        .collect();
     if json {
         let items: Vec<_> = sessions
             .iter()
@@ -111,6 +161,11 @@ fn list(client: Option<&str>, json: bool) -> Result<()> {
                     "title": session.title,
                     "path": session.path.display().to_string(),
                     "cwd": session.cwd,
+                    "workspace": session.workspace.as_ref().map(|workspace| json!({
+                        "id": workspace.id,
+                        "path": workspace.path,
+                        "title": workspace.title,
+                    })),
                     "bytes": session.bytes,
                     "messages": session.messages,
                     "locked": session.locked,
@@ -127,7 +182,11 @@ fn list(client: Option<&str>, json: bool) -> Result<()> {
     }
 
     if sessions.is_empty() {
-        println!("没有找到会话。用 `sesstui doctor` 检查扫描路径。");
+        if let Some(group) = &workspace {
+            println!("工作区「{}」下没有会话。", group.title());
+        } else {
+            println!("没有找到会话。用 `sesstui doctor` 检查扫描路径。");
+        }
         return Ok(());
     }
 
@@ -145,6 +204,76 @@ fn list(client: Option<&str>, json: bool) -> Result<()> {
         count_client(&sessions, Client::Codex),
         count_client(&sessions, Client::Opencode),
     );
+    if let Some(group) = &workspace {
+        println!(
+            "工作区：{} · {}",
+            group.title(),
+            group.path().unwrap_or("未识别")
+        );
+    }
+    Ok(())
+}
+
+fn workspaces_cmd(client: Option<&str>, json: bool) -> Result<()> {
+    let client = client.map(parse_client).transpose()?;
+    let snapshot = scan::scan();
+    let groups = workspace_groups(&snapshot, client);
+    if json {
+        let items: Vec<_> = groups
+            .iter()
+            .map(|group| {
+                json!({
+                    "client": group.client.key(),
+                    "id": group.workspace.as_ref().map(|workspace| workspace.id.clone()),
+                    "key": group.key,
+                    "path": group.path(),
+                    "title": group.title(),
+                    "sessions": group.count(),
+                    "bytes": group.bytes,
+                    "messages": group.messages,
+                    "locked": group.locked,
+                    "updated": group.updated.map(util::local_datetime),
+                    "synthetic": group.workspace.as_ref().is_some_and(|workspace| workspace.is_synthetic()),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&items)?);
+        return Ok(());
+    }
+
+    if groups.is_empty() {
+        println!("没有找到工作区。用 `sesstui doctor` 检查扫描路径。");
+        return Ok(());
+    }
+
+    let widths = WorkspaceWidths::new(&groups);
+    println!(
+        "{}  {}  {}  {}  {}  路径",
+        pad_right("客户端", widths.client),
+        pad_right("工作区", widths.title),
+        pad_right("会话", widths.sessions),
+        pad_right("大小", widths.size),
+        pad_right("最近更新", widths.updated),
+    );
+    for group in &groups {
+        println!(
+            "{}  {}  {}  {}  {}  {}",
+            pad_right(group.client.label(), widths.client),
+            pad_right(&util::truncate(group.title(), widths.title), widths.title),
+            pad_right(&group.count().to_string(), widths.sessions),
+            pad_right(&group.size_label(), widths.size),
+            pad_right(&group.time_label(), widths.updated),
+            group.path().unwrap_or("未识别"),
+        );
+    }
+    let sessions: usize = groups.iter().map(WorkspaceGroup::count).sum();
+    let bytes: u64 = groups.iter().map(|group| group.bytes).sum();
+    println!(
+        "\n共 {} 个工作区 · {} 个会话 · {}",
+        groups.len(),
+        sessions,
+        util::human_bytes(bytes)
+    );
     Ok(())
 }
 
@@ -158,6 +287,7 @@ fn count_client(sessions: &[Session], client: Client) -> usize {
 struct TableWidths {
     client: usize,
     updated: usize,
+    workspace: usize,
     size: usize,
     messages: usize,
 }
@@ -172,6 +302,18 @@ impl TableWidths {
                 .unwrap_or(6)
                 .max(6),
             updated: 16,
+            workspace: sessions
+                .iter()
+                .map(|session| {
+                    session
+                        .workspace
+                        .as_ref()
+                        .map(|workspace| UnicodeWidthStr::width(workspace.title.as_str()))
+                        .unwrap_or(4)
+                })
+                .max()
+                .unwrap_or(4)
+                .clamp(4, 24),
             size: sessions
                 .iter()
                 .map(|session| session.size_label().len())
@@ -179,6 +321,41 @@ impl TableWidths {
                 .unwrap_or(6)
                 .max(6),
             messages: 5,
+        }
+    }
+}
+
+struct WorkspaceWidths {
+    client: usize,
+    title: usize,
+    sessions: usize,
+    size: usize,
+    updated: usize,
+}
+
+impl WorkspaceWidths {
+    fn new(groups: &[WorkspaceGroup]) -> Self {
+        Self {
+            client: groups
+                .iter()
+                .map(|group| group.client.label().len())
+                .max()
+                .unwrap_or(6)
+                .max(6),
+            title: groups
+                .iter()
+                .map(|group| UnicodeWidthStr::width(group.title()))
+                .max()
+                .unwrap_or(8)
+                .clamp(8, 30),
+            sessions: 4,
+            size: groups
+                .iter()
+                .map(|group| group.size_label().len())
+                .max()
+                .unwrap_or(6)
+                .max(6),
+            updated: 16,
         }
     }
 }
@@ -193,9 +370,10 @@ fn pad_right(text: &str, width: usize) -> String {
 
 fn header_row(widths: &TableWidths) -> String {
     format!(
-        "{}  {}  {}  {}  {}  {}",
+        "{}  {}  {}  {}  {}  {}  {}",
         pad_right("客户端", widths.client),
         pad_right("更新时间", widths.updated),
+        pad_right("工作区", widths.workspace),
         pad_right("大小", widths.size),
         pad_right("消息", widths.messages),
         pad_right("状态", 6),
@@ -204,8 +382,13 @@ fn header_row(widths: &TableWidths) -> String {
 }
 
 fn session_row(session: &Session, widths: &TableWidths) -> String {
+    let workspace = session
+        .workspace
+        .as_ref()
+        .map(|workspace| util::truncate(&workspace.title, widths.workspace))
+        .unwrap_or_else(|| "未识别".to_string());
     format!(
-        "{}  {}  {}  {}  {}  {}",
+        "{}  {}  {}  {}  {}  {}  {}",
         pad_right(session.client.label(), widths.client),
         pad_right(
             &session
@@ -214,6 +397,7 @@ fn session_row(session: &Session, widths: &TableWidths) -> String {
                 .unwrap_or_else(|| "--".to_string()),
             widths.updated
         ),
+        pad_right(&workspace, widths.workspace),
         pad_right(&session.size_label(), widths.size),
         pad_right(&session.messages.to_string(), widths.messages),
         pad_right(
@@ -252,6 +436,148 @@ fn resolve(sessions: &[Session], spec: &str) -> Result<Session> {
                 .join(" / ")
         ),
     }
+}
+
+/// 工作区 `<spec>`：标识、完整路径、标题或路径末段，可带 `client:` 前缀。
+fn resolve_workspace(groups: &[WorkspaceGroup], spec: &str) -> Result<WorkspaceGroup> {
+    let (client, text) = match spec.split_once(':') {
+        Some((prefix, rest)) if Client::from_key(prefix).is_some() => {
+            (Client::from_key(prefix), rest)
+        }
+        _ => (None, spec),
+    };
+    let matches: Vec<&WorkspaceGroup> = groups
+        .iter()
+        .filter(|group| client.is_none_or(|wanted| group.client == wanted))
+        .filter(|group| group.matches_spec(text))
+        .collect();
+    match matches.len() {
+        0 => bail!("没有找到工作区：{spec}（用 `sesstui workspaces` 查看可用项）"),
+        1 => Ok(matches[0].clone()),
+        _ => bail!(
+            "{spec} 匹配到多个工作区，请用完整路径或标识（{}）",
+            matches
+                .iter()
+                .map(|group| group.key.clone())
+                .collect::<Vec<_>>()
+                .join(" / ")
+        ),
+    }
+}
+
+fn delete_workspace_cmd(
+    specs: &[String],
+    dry_run: bool,
+    client: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let client = client.map(parse_client).transpose()?;
+    if specs.is_empty() {
+        bail!("请给出至少一个工作区（标识、路径或标题；用 `sesstui workspaces` 查看）");
+    }
+    let snapshot = scan::scan();
+    let groups = workspace_groups(&snapshot, client);
+    let mut targets: Vec<WorkspaceGroup> = Vec::new();
+    let mut seen = BTreeSet::new();
+    for spec in specs {
+        let group = resolve_workspace(&groups, spec)?;
+        if seen.insert(group.key.clone()) {
+            targets.push(group);
+        }
+    }
+
+    let mut deleted = 0usize;
+    let mut bytes = 0u64;
+    let mut skipped = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    let mut deregistered = 0usize;
+    let mut rows = Vec::new();
+    for group in &targets {
+        let sessions: Vec<Session> = group
+            .indices
+            .iter()
+            .filter_map(|index| snapshot.sessions.get(*index).cloned())
+            .collect();
+        let report = delete::delete_workspace(&sessions, group.workspace.as_ref(), dry_run);
+        deleted += report.deleted;
+        bytes += report.bytes;
+        skipped += report.skipped;
+        errors.extend(report.errors.iter().cloned());
+        if report.deregistered {
+            deregistered += 1;
+        }
+        rows.push((group.clone(), report));
+    }
+
+    if json {
+        let items: Vec<_> = rows
+            .iter()
+            .map(|(group, report)| {
+                json!({
+                    "key": group.key,
+                    "title": group.title(),
+                    "path": group.path(),
+                    "deleted": report.deleted,
+                    "bytes": report.bytes,
+                    "skipped": report.skipped,
+                    "deregistered": report.deregistered,
+                    "errors": report.errors,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "dry_run": dry_run,
+                "deleted": deleted,
+                "bytes": bytes,
+                "skipped": skipped,
+                "deregistered": deregistered,
+                "errors": errors,
+                "workspaces": items,
+            }))?
+        );
+    } else {
+        for (group, report) in &rows {
+            let status = if dry_run {
+                "将删除"
+            } else if report.failed() {
+                "部分失败"
+            } else {
+                "已删除"
+            };
+            println!(
+                "{status} · 工作区 {} · {} 个会话 · {}（{}）{}",
+                group.client.label(),
+                report.deleted,
+                util::human_bytes(report.bytes),
+                group.title(),
+                if report.deregistered {
+                    " · 已移除登记"
+                } else {
+                    ""
+                }
+            );
+        }
+        println!(
+            "\n{} 个工作区 · {} 个会话 · 释放 {}{}",
+            targets.len(),
+            deleted,
+            util::human_bytes(bytes),
+            if dry_run { "（演练）" } else { "" }
+        );
+        if deregistered > 0 {
+            println!("已移除 {deregistered} 个工作区登记；项目目录保持原样。");
+        }
+        for error in &errors {
+            println!("错误：{error}");
+        }
+    }
+
+    if !errors.is_empty() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 fn delete_cmd(ids: &[String], dry_run: bool, client: Option<&str>, json: bool) -> Result<()> {
@@ -327,9 +653,11 @@ fn doctor() -> Result<()> {
                 .unwrap_or_default()
         );
     }
+    let groups = workspace_groups(&snapshot, None);
     println!(
-        "\n合计 {} 个会话 · {}",
+        "\n合计 {} 个会话 · {} 个工作区 · {}",
         snapshot.sessions.len(),
+        groups.len(),
         util::human_bytes(snapshot.bytes(None))
     );
 
