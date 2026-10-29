@@ -642,6 +642,62 @@ mod tests {
         assert_eq!(app.marked_count(), 0);
     }
 
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn delete_opens_confirm_and_escape_cancels() {
+        let mut app = app_with(vec![
+            session(Client::Dsh, "a", "A"),
+            session(Client::Dsh, "b", "B"),
+        ]);
+        press(&mut app, KeyCode::Char(' '));
+        assert_eq!(app.marked_count(), 1);
+        press(&mut app, KeyCode::Char('d'));
+        let modal = app.modal.as_ref().expect("确认框应打开");
+        assert_eq!(modal.indices, vec![0]);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.modal.is_none());
+        assert!(!app.quitting);
+    }
+
+    #[test]
+    fn delete_without_selection_uses_current_row() {
+        let mut app = app_with(vec![
+            session(Client::Dsh, "a", "A"),
+            session(Client::Codex, "b", "B"),
+        ]);
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.modal.as_ref().expect("确认框应打开").indices, vec![1]);
+    }
+
+    #[test]
+    fn filter_mode_edits_and_applies() {
+        let mut app = app_with(vec![
+            session(Client::Dsh, "a", "修复 Wayland 崩溃"),
+            session(Client::Codex, "b", "重构扫描器"),
+        ]);
+        press(&mut app, KeyCode::Char('/'));
+        assert!(app.filter_editing);
+        for ch in "codex".chars() {
+            press(&mut app, KeyCode::Char(ch));
+        }
+        assert_eq!(app.filter, "codex");
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.filter_editing);
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(app.sessions[app.rows[0]].id, "b");
+    }
+
+    #[test]
+    fn quit_key_sets_quitting() {
+        let mut app = app_with(vec![]);
+        press(&mut app, KeyCode::Char('q'));
+        assert!(app.quitting);
+    }
+
     #[test]
     fn client_cycle_wraps() {
         let mut app = app_with(vec![]);
