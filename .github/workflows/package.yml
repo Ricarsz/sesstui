@@ -1,0 +1,59 @@
+name: package
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  arch-package:
+    name: Build Arch package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Build with makepkg in Arch Linux
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          docker run --rm \
+            -v "$PWD:/src:ro" \
+            -v "$PWD/dist:/out" \
+            archlinux:base-devel \
+            bash -euxo pipefail -c '
+              pacman -Syu --noconfirm --needed git rust
+              useradd -m builder
+              cp -a /src /home/builder/work
+              chown -R builder /home/builder/work
+              su builder -c "cd /home/builder/work && PKGDEST=/home/builder/pkg makepkg -f --nodeps --noconfirm"
+              cp /home/builder/pkg/*.pkg.tar.zst /out/
+            '
+          cd dist
+          sha256sum ./*.pkg.tar.zst > sha256sums.txt
+          cat sha256sums.txt
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sesstui-arch
+          path: dist/*
+
+      - name: Publish GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*.pkg.tar.zst dist/sha256sums.txt \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "SessTui ${GITHUB_REF_NAME}" \
+            --generate-notes

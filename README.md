@@ -1,5 +1,7 @@
 # SessTui
 
+[![package](https://github.com/Ricarsz/sesstui/actions/workflows/package.yml/badge.svg)](https://github.com/Ricarsz/sesstui/actions/workflows/package.yml)
+
 一个终端界面，用来查看、筛选和删除本机 AI 编码客户端留下的会话：
 
 - **DeepSeek Harness**（`~/.dsh`）
