@@ -9,14 +9,24 @@
 所有会话汇总到一个列表里，显示标题、最后更新、占用空间、消息数和是否正在使用；
 支持多选删除、按客户端切换、按关键字过滤，删除前要确认，也可以只演练。
 
-## 构建
+## 安装
+
+Arch Linux 用 AUR：
+
+```sh
+paru -S sesstui
+```
+
+从仓库里的 `PKGBUILD` 本地构建并安装：
 
 ```sh
 git clone <repo-url> SessTui
 cd SessTui
-cargo build --release
+paru -Bi .
+# 或者：makepkg -si
 ```
 
+只想要二进制的话，直接 `cargo build --release`，产物在 `target/release/sesstui`。
 需要 Rust 1.88 或更新（使用了 let-chains）。运行时优先用内置的纯 Rust zstd 解码；
 系统里有 `zstd` 命令时会作为兜底。
 
