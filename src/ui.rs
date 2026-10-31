@@ -113,6 +113,15 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
         }
         parts.push(bili);
     }
+    if let Some(summary) = &app.magic
+        && summary.known()
+    {
+        let mut magic = format!("magic {} 间", summary.compartments);
+        if summary.orphans > 0 {
+            magic.push_str(&format!(" · 残留 {}", summary.orphans));
+        }
+        parts.push(magic);
+    }
     if !app.warnings.is_empty() {
         parts.push(format!("{} 警告", app.warnings.len()));
     }
@@ -278,8 +287,12 @@ fn session_line(
     };
     let time = format!("{}  ", session.time_label());
     let badge = badge_text(session.client);
-    let flag = if session.bili.is_some() { "• " } else { "  " };
-    // 树枝 5 + 勾选 2 + 时间 13 + badge 5 + bili 标记 2，再加大小列 7。
+    let flag = if session.bili.is_some() || session.magic.is_some() {
+        "• "
+    } else {
+        "  "
+    };
+    // 树枝 5 + 勾选 2 + 时间 13 + badge 5 + 附带标记 2，再加大小列 7。
     let used = 5 + 2 + 13 + 5 + 2;
     let title = util::truncate(&session.title, width.saturating_sub(used + 8).max(6));
     let title_width = UnicodeWidthStr::width(title.as_str());
@@ -449,6 +462,33 @@ impl App {
             )));
         }
 
+        if let Some(meta) = &session.magic {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  magic-context",
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.push(kv(
+                palette,
+                "隔间",
+                format!("{} 个 · {}", meta.compartments, meta.status),
+            ));
+            lines.push(kv(
+                palette,
+                "最后活动",
+                meta.updated
+                    .map(util::local_datetime)
+                    .unwrap_or_else(|| "--".to_string()),
+            ));
+            lines.push(kv(palette, "数据库", meta.db.display().to_string()));
+            lines.push(Line::from(Span::styled(
+                "  删除本会话时会一并清理这些记录。",
+                Style::default().fg(palette.dim),
+            )));
+        }
+
         if let Some((input, output)) = session.tokens {
             lines.push(kv(
                 palette,
@@ -536,6 +576,23 @@ impl App {
                 palette,
                 "bili 附带",
                 format!("{} · {} 个会话", util::human_bytes(bili_bytes), linked),
+            ));
+        }
+        let magic: Vec<&Session> = group
+            .indices
+            .iter()
+            .filter_map(|index| self.sessions.get(*index))
+            .filter(|session| session.magic.is_some())
+            .collect();
+        if !magic.is_empty() {
+            let compartments: u32 = magic
+                .iter()
+                .map(|session| session.magic_compartments())
+                .sum();
+            lines.push(kv(
+                palette,
+                "magic",
+                format!("{compartments} 个隔间 · {} 个会话", magic.len()),
             ));
         }
         let (state_text, state_color) = if group.locked > 0 {
@@ -658,6 +715,10 @@ fn draw_confirm(frame: &mut Frame, app: &App, area: Rect, modal: &Confirm, palet
         sessions.iter().map(|session| session.total_bytes()).sum()
     };
     let bili_bytes: u64 = sessions.iter().map(|session| session.bili_bytes()).sum();
+    let magic_compartments: u32 = sessions
+        .iter()
+        .map(|session| session.magic_compartments())
+        .sum();
     let locked = sessions.iter().filter(|session| session.locked).count();
     let deleting_workspace = group.is_some();
 
@@ -684,6 +745,12 @@ fn draw_confirm(frame: &mut Frame, app: &App, area: Rect, modal: &Confirm, palet
                 "  其中 billion-context 数据 {}（一并清理）",
                 util::human_bytes(bili_bytes)
             ),
+            Style::default().fg(palette.warn),
+        )));
+    }
+    if magic_compartments > 0 {
+        body.push(Line::from(Span::styled(
+            format!("  其中 magic-context 记录 {magic_compartments} 个隔间（一并清理）"),
             Style::default().fg(palette.warn),
         )));
     }
@@ -788,7 +855,7 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect, palette: Palette) {
         Line::from("  q / Esc           退出（先清过滤，再清勾选）"),
         Line::from(""),
         Line::from(Span::styled(
-            "工作区与 billion-context",
+            "工作区与附带数据",
             Style::default()
                 .fg(palette.accent)
                 .add_modifier(Modifier::BOLD),
@@ -852,6 +919,14 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect, palette: Palette) {
     )));
     lines.push(Line::from(Span::styled(
         "连带清理 ~/.local/share/billion-context/sessions/index.db，并回收无人引用的 content。",
+        Style::default().fg(palette.dim),
+    )));
+    lines.push(Line::from(Span::styled(
+        "magic-context：Opencode 会话行带 • 标记；删除时按同名 session_id 清掉",
+        Style::default().fg(palette.dim),
+    )));
+    lines.push(Line::from(Span::styled(
+        "~/.local/share/cortexkit/magic-context/context.db 里的全部记录。",
         Style::default().fg(palette.dim),
     )));
     lines.push(Line::from(""));
@@ -978,7 +1053,7 @@ mod render_tests {
     use super::*;
     use crate::app::{App, Confirm, ConfirmTarget, NoticeKind};
     use crate::config::Config;
-    use crate::model::{BiliMeta, Client, Session, Workspace};
+    use crate::model::{BiliMeta, Client, MagicMeta, Session, Workspace};
     use crate::scan::{Root, Snapshot};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -1003,6 +1078,7 @@ mod render_tests {
             cost: Some(0.25),
             locked: false,
             bili: None,
+            magic: None,
         }
     }
 
@@ -1044,6 +1120,12 @@ mod render_tests {
             "/workspace/projects",
             "projects",
         ));
+        oc.magic = Some(MagicMeta {
+            db: PathBuf::from("/tmp/context.db"),
+            compartments: 3,
+            updated: Some(SystemTime::now()),
+            status: "opencode2".into(),
+        });
         let snapshot = Snapshot {
             sessions: vec![dsh, oc, codex],
             workspaces: vec![
@@ -1058,6 +1140,7 @@ mod render_tests {
             }],
             warnings: Vec::new(),
             bili: None,
+            magic: None,
         };
         let mut app = App::from_snapshot(snapshot, Config::default());
         app.notice = crate::app::Notice {
@@ -1123,6 +1206,29 @@ mod render_tests {
             let mut app = sample_app();
             let _ = render(&mut app, width, height);
         }
+    }
+
+    #[test]
+    fn renders_magic_context_details_and_confirm_line() {
+        let mut app = sample_app();
+        app.selected = app
+            .rows
+            .iter()
+            .position(|row| match row {
+                Row::Session { session, .. } => app.sessions[*session].magic.is_some(),
+                Row::Workspace { .. } => false,
+            })
+            .expect("Opencode 会话行");
+        let text = render(&mut app, 120, 34);
+        assert!(text.contains("magic-context"), "{text}");
+        assert!(text.contains("3 个 · opencode2"), "{text}");
+
+        app.modal = Some(Confirm {
+            target: ConfirmTarget::Sessions(vec![0, 1, 2]),
+            dry_run: false,
+        });
+        let text = render(&mut app, 100, 30);
+        assert!(text.contains("其中 magic-context 记录 3 个隔间"), "{text}");
     }
 
     #[test]

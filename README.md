@@ -12,7 +12,8 @@
 默认展开，`Enter` 或 `←`/`→` 可以折叠；会话行缩进显示更新时间、客户端、标题和大小。
 支持多选删除、整组删除工作区、按客户端切换、按关键字过滤，删除前要确认，也可以只演练。
 
-经过 billion-context 代理的 DSH 会话会标出附带数据的大小，删除时一并清理。
+经过 billion-context 代理的 DSH 会话、接入 magic-context 的 Opencode 会话都会标出附带数据，
+删除时一并清理。
 
 ## 安装
 
@@ -103,6 +104,7 @@ TUI 里工作区标题行默认展开，按 `Enter` 或 `←`/`→` 折叠、展
 | Codex | `~/.codex*/sessions/YYYY/MM/DD/rollout-*.jsonl` | 删除 rollout 文件，并同步移除 `session_index.jsonl` 里的记录 |
 | Opencode | `~/.local/share/opencode/opencode.db` | 在事务里删除 `session_v2` 行，消息等子表由外键级联删除 |
 | billion-context | `~/.local/share/billion-context/sessions/index.db` | 随 DSH 会话一起删除：事务内清掉同名 `session_id` 的各表记录，并回收无人引用的 `content` |
+| magic-context | `~/.local/share/cortexkit/magic-context/context.db` | 随 Opencode 会话一起删除：事务内删掉所有带 `session_id` 列的表里该会话的行 |
 
 扫描位置可以用环境变量覆盖，多个路径用 `:` 分隔：
 
@@ -111,6 +113,7 @@ SESSTUI_DSH_ROOT=~/.dsh-alt sesstui list
 SESSTUI_CODEX_HOME=~/.codex-alt sesstui doctor
 SESSTUI_OPENCODE_DIR=/path/to/opencode sesstui list
 SESSTUI_BILI_DIR=/path/to/billion-context sesstui doctor
+SESSTUI_MAGIC_DIR=/path/to/magic-context sesstui doctor
 ```
 
 若多个根目录的 `sessions/` 指向同一份存储（例如用符号链接共享），只会列一次，
@@ -130,6 +133,23 @@ DSH 会话只要经过 billion-context 代理，就会在 `sessions/index.db` �
 `sesstui doctor` 会检查数据库、`-wal`/`-shm`/锁文件，并统计对不上 DSH 的残留记录。
 数据根可用 `SESSTUI_BILI_DIR` 覆盖，指向目录或 `index.db` 都行。
 
+## magic-context 联动
+
+Opencode 会话装过 magic-context 插件后，`context.db` 里会留下同名记录（`session_id`
+就是 opencode 的 `ses_...`）。SessTui 打开时会扫这份库：
+
+- 会话行的客户端标记后带 `•`，详情面板显示隔间数、最后活动时间与数据库路径；
+- 工作区详情汇总该工作区里的 magic-context 隔间数；
+- 删除 Opencode 会话时，在同一个事务里删掉所有带 `session_id` 列的表里的对应行
+  （插件版本升级新增的表也能覆盖），不碰 `memories`、`workspaces` 等跨会话数据；
+- 清理失败不会影响 Opencode 会话本身的删除，只在状态栏给出提示。
+
+插件本身只在收到 opencode 的 `session.deleted` 事件时清理；SessTui 直接改库不产生
+这个事件，所以在删除流程里补做一次。
+
+`sesstui doctor` 会检查数据库、`-wal`/`-shm`、关联与残留记录、隔间总数。
+数据根可用 `SESSTUI_MAGIC_DIR` 覆盖，指向目录或 `context.db` 都行。
+
 ## 配置
 
 路径：`$XDG_CONFIG_HOME/sesstui/config.toml`，默认 `~/.config/sesstui/config.toml`。
@@ -147,7 +167,7 @@ confirm_delete = true  # 删除前弹确认框
 - DeepSeek Harness 会话被其他进程加锁时直接跳过，不会强删。
 - Opencode 的删除在单个事务里完成，失败会整体回滚。
 - 删除工作区只清理会话存储与登记，项目目录保持原样；有会话删不掉时保留登记。
-- billion-context 的数据在删除 DSH 会话的同一流程里清理；清理失败会保留 DSH 会话的删除结果并提示。
+- billion-context / magic-context 的数据在删除对应会话的同一流程里清理；清理失败会保留会话本身的删除结果并提示。
 - `sesstui delete --dry-run` 与 `sesstui delete-workspace --dry-run` 只打印目标，不落盘。
 
 ## 限制

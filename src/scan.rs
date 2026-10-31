@@ -38,6 +38,8 @@ pub struct Snapshot {
     pub warnings: Vec<String>,
     /// billion-context 的存储概况；本机没装 bili 时为空。
     pub bili: Option<crate::bili::Summary>,
+    /// magic-context 的存储概况；本机没装 magic-context 时为空。
+    pub magic: Option<crate::magic::Summary>,
 }
 
 impl Snapshot {}
@@ -89,6 +91,12 @@ pub fn scan() -> Snapshot {
     if let Some(summary) = &snapshot.bili {
         for error in &summary.errors {
             snapshot.warnings.push(format!("billion-context：{error}"));
+        }
+    }
+    snapshot.magic = crate::magic::attach(&mut snapshot.sessions);
+    if let Some(summary) = &snapshot.magic {
+        for error in &summary.errors {
+            snapshot.warnings.push(format!("magic-context：{error}"));
         }
     }
     snapshot
@@ -440,6 +448,7 @@ fn load_dsh_session(
         cost: None,
         locked,
         bili: None,
+        magic: None,
     }))
 }
 
@@ -758,6 +767,7 @@ fn load_codex_session(
         cost: None,
         locked: false,
         bili: None,
+        magic: None,
     })
 }
 
@@ -993,6 +1003,7 @@ fn load_opencode_sessions(db: &Path, root: &Path) -> Result<(Vec<Session>, Vec<W
             cost: Some(cost),
             locked: false,
             bili: None,
+            magic: None,
         });
     }
     Ok((sessions, projects))

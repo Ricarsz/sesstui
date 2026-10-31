@@ -7,6 +7,7 @@ mod bili;
 mod cli;
 mod config;
 mod delete;
+mod magic;
 mod model;
 mod scan;
 mod theme;

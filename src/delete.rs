@@ -189,9 +189,19 @@ fn delete_opencode(session: &Session) -> Result<Outcome> {
     if removed == 0 {
         bail!("数据库里没有该会话，可能已被删除");
     }
+    // magic-context 用同一个会话 id 记账；它在 opencode 里收到删除事件才
+    // 会自己清，SessTui 直接改库不产生事件，所以这里补一刀。
+    let mut warnings = Vec::new();
+    if let Some(meta) = &session.magic
+        && let Err(error) = crate::magic::delete_session(&meta.db, &session.id)
+    {
+        warnings.push(format!(
+            "Opencode 会话已删除，但 magic-context 数据没清理干净：{error:#}"
+        ));
+    }
     Ok(Outcome {
         bytes: session.bytes,
-        warnings: Vec::new(),
+        warnings,
     })
 }
 
@@ -437,7 +447,7 @@ fn ensure_inside(child: &Path, parent: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::BiliMeta;
+    use crate::model::{BiliMeta, MagicMeta};
     use rusqlite::Connection;
     use std::path::{Path, PathBuf};
     use std::time::UNIX_EPOCH;
@@ -526,6 +536,7 @@ mod tests {
                 updated: None,
                 status: "active".to_string(),
             }),
+            magic: None,
         }
     }
 
@@ -584,5 +595,113 @@ mod tests {
         assert_eq!(outcome.bytes, 2048);
         assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
         assert!(outcome.warnings[0].contains("billion-context"));
+    }
+
+    /// opencode 库与 magic-context 库各有一条 `target` 与 `keep` 会话。
+    fn opencode_fixture(scratch: &Scratch) -> (PathBuf, PathBuf) {
+        let db = scratch.path().join("opencode").join("opencode.db");
+        fs::create_dir_all(db.parent().expect("父目录")).expect("建目录");
+        let conn = Connection::open(&db).expect("建 opencode 库");
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, title TEXT);
+             INSERT INTO session_v2 VALUES ('ses_target', 'target');
+             INSERT INTO session_v2 VALUES ('ses_keep', 'keep');",
+        )
+        .expect("建表");
+        let magic = scratch
+            .path()
+            .join("magic")
+            .join("cortexkit")
+            .join("magic-context")
+            .join("context.db");
+        fs::create_dir_all(magic.parent().expect("父目录")).expect("建目录");
+        let conn = Connection::open(&magic).expect("建 magic 库");
+        conn.execute_batch(
+            "CREATE TABLE session_meta (session_id TEXT PRIMARY KEY, harness TEXT,
+                last_response_time INTEGER NOT NULL);
+             CREATE TABLE compartments (session_id TEXT NOT NULL, seq INTEGER NOT NULL);
+             CREATE TABLE tags (session_id TEXT NOT NULL, tag TEXT NOT NULL);
+             CREATE TABLE schema_migrations_meta (key TEXT PRIMARY KEY, value TEXT);
+             INSERT INTO session_meta VALUES ('ses_target', 'opencode2', 1700000000000);
+             INSERT INTO session_meta VALUES ('ses_keep', 'opencode2', 1700000000000);
+             INSERT INTO compartments VALUES ('ses_target', 0);
+             INSERT INTO compartments VALUES ('ses_keep', 0);
+             INSERT INTO tags VALUES ('ses_target', 'a');
+             INSERT INTO schema_migrations_meta VALUES ('schema', 'v95');",
+        )
+        .expect("建表");
+        (db, magic)
+    }
+
+    fn opencode_session(db: PathBuf, magic: PathBuf) -> Session {
+        Session {
+            client: Client::Opencode,
+            id: "ses_target".to_string(),
+            title: "opencode 会话".to_string(),
+            preview: String::new(),
+            path: db,
+            root: PathBuf::from("/tmp"),
+            cwd: None,
+            workspace: None,
+            created: None,
+            updated: None,
+            bytes: 0,
+            messages: 0,
+            tokens: None,
+            cost: None,
+            locked: false,
+            bili: None,
+            magic: Some(MagicMeta {
+                db: magic,
+                compartments: 1,
+                updated: None,
+                status: "opencode2".to_string(),
+            }),
+        }
+    }
+
+    #[test]
+    fn deletes_opencode_session_and_its_magic_rows() {
+        let scratch = Scratch::new("delete-magic");
+        let (db, magic_db) = opencode_fixture(&scratch);
+        let session = opencode_session(db.clone(), magic_db.clone());
+
+        let outcome = delete(&session).expect("删除");
+
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let conn = Connection::open(&db).expect("打开 opencode");
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_v2", [], |row| row.get(0))
+            .expect("计数");
+        assert_eq!(left, 1, "只该删掉 target");
+        let conn = Connection::open(&magic_db).expect("打开 magic");
+        let sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_meta", [], |row| row.get(0))
+            .expect("计数");
+        assert_eq!(sessions, 1);
+        let tags: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tags", [], |row| row.get(0))
+            .expect("计数");
+        assert_eq!(tags, 0);
+    }
+
+    #[test]
+    fn opencode_delete_survives_a_broken_magic_database() {
+        let scratch = Scratch::new("delete-magic-broken");
+        let (db, magic_db) = opencode_fixture(&scratch);
+        // 文件名不是 context.db，magic 删除会拒绝；opencode 会话仍应删掉并给出提示。
+        let broken = magic_db.with_file_name("other.db");
+        fs::rename(&magic_db, &broken).expect("改名");
+        let session = opencode_session(db.clone(), broken);
+
+        let outcome = delete(&session).expect("删除");
+
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert!(outcome.warnings[0].contains("magic-context"));
+        let conn = Connection::open(&db).expect("打开 opencode");
+        let left: i64 = conn
+            .query_row("SELECT COUNT(*) FROM session_v2", [], |row| row.get(0))
+            .expect("计数");
+        assert_eq!(left, 1);
     }
 }

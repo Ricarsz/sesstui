@@ -112,6 +112,21 @@ pub struct BiliMeta {
     pub status: String,
 }
 
+/// magic-context 为同一个 opencode 会话留下的存储记录。
+///
+/// magic-context 的 `session_id` 与 opencode 的会话 id 同名，所以扫描时
+/// 能直接按 id 对上。它没有 bili 那样的内容表，用隔间数衡量体量。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MagicMeta {
+    /// 记录所在的 `context.db`。
+    pub db: PathBuf,
+    /// 已经切出来的隔间数。
+    pub compartments: u32,
+    pub updated: Option<SystemTime>,
+    /// 记录该会话的 harness，通常是 `opencode2`。
+    pub status: String,
+}
+
 /// 一条会话记录。
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -136,6 +151,8 @@ pub struct Session {
     pub locked: bool,
     /// billion-context 侧的同一会话；没接入或没数据时为空。
     pub bili: Option<BiliMeta>,
+    /// magic-context 侧的同一会话；没接入或没数据时为空。
+    pub magic: Option<MagicMeta>,
 }
 
 impl Session {
@@ -168,6 +185,11 @@ impl Session {
     /// billion-context 侧的占用；没接入时是 0。
     pub fn bili_bytes(&self) -> u64 {
         self.bili.as_ref().map_or(0, |meta| meta.bytes)
+    }
+
+    /// magic-context 侧的隔间数；没接入时是 0。
+    pub fn magic_compartments(&self) -> u32 {
+        self.magic.as_ref().map_or(0, |meta| meta.compartments)
     }
 
     /// 删除时总共会释放的字节数（会话自身 + bili 附带的数据）。
@@ -369,6 +391,7 @@ mod tests {
             cost: None,
             locked: false,
             bili: None,
+            magic: None,
         }
     }
 

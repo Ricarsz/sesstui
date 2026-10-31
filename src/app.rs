@@ -12,6 +12,7 @@ use ratatui::layout::Rect;
 use crate::bili;
 use crate::config::Config;
 use crate::delete;
+use crate::magic;
 use crate::model::{self, Client, Session, Workspace, WorkspaceGroup};
 use crate::scan::{self, Root};
 use crate::theme::Palette;
@@ -78,6 +79,8 @@ pub struct App {
     pub warnings: Vec<String>,
     /// billion-context 的存储概况；本机没装 bili 时为空。
     pub bili: Option<bili::Summary>,
+    /// magic-context 的存储概况；本机没装 magic-context 时为空。
+    pub magic: Option<magic::Summary>,
     /// 树形列表的可见行：工作区标题行与会话行交错。
     pub rows: Vec<Row>,
     pub selected: usize,
@@ -116,6 +119,7 @@ impl App {
             roots: snapshot.roots,
             warnings: snapshot.warnings,
             bili: snapshot.bili,
+            magic: snapshot.magic,
             rows: Vec::new(),
             selected: 0,
             collapsed: BTreeSet::new(),
@@ -157,6 +161,7 @@ impl App {
         self.roots = snapshot.roots;
         self.warnings = snapshot.warnings;
         self.bili = snapshot.bili;
+        self.magic = snapshot.magic;
         self.last_scan = Instant::now();
         self.rebuild_rows();
         if let Some(key) = previous
@@ -970,6 +975,7 @@ mod tests {
             cost: None,
             locked: false,
             bili: None,
+            magic: None,
         }
     }
 
@@ -990,6 +996,7 @@ mod tests {
             roots: Vec::new(),
             warnings: Vec::new(),
             bili: None,
+            magic: None,
         };
         App::from_snapshot(snapshot, Config::default())
     }

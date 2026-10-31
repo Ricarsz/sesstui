@@ -11,6 +11,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::bili;
 use crate::config::Config;
 use crate::delete;
+use crate::magic;
 use crate::model::{self, Client, Session, WorkspaceGroup};
 use crate::scan;
 use crate::util;
@@ -175,6 +176,12 @@ fn list(client: Option<&str>, workspace: Option<&str>, json: bool) -> Result<()>
                         "status": meta.status,
                         "updated": meta.updated.map(util::local_datetime),
                     })),
+                    "magic": session.magic.as_ref().map(|meta| json!({
+                        "db": meta.db.display().to_string(),
+                        "compartments": meta.compartments,
+                        "status": meta.status,
+                        "updated": meta.updated.map(util::local_datetime),
+                    })),
                     "messages": session.messages,
                     "locked": session.locked,
                     "tokens_input": session.tokens.map(|tokens| tokens.0),
@@ -215,6 +222,10 @@ fn list(client: Option<&str>, workspace: Option<&str>, json: bool) -> Result<()>
     );
     if bili > 0 {
         println!("其中 billion-context 数据 {}", util::human_bytes(bili));
+    }
+    let magic: u32 = sessions.iter().map(Session::magic_compartments).sum();
+    if magic > 0 {
+        println!("其中 magic-context 记录 {magic} 个隔间");
     }
     if let Some(group) = &workspace {
         println!(
@@ -389,7 +400,7 @@ fn header_row(widths: &TableWidths) -> String {
         pad_right("更新时间", widths.updated),
         pad_right("工作区", widths.workspace),
         pad_right("大小", widths.size),
-        pad_right("bili", widths.bili),
+        pad_right("附带", widths.bili),
         pad_right("消息", widths.messages),
         pad_right("状态", 6),
         "标题"
@@ -402,8 +413,10 @@ fn session_row(session: &Session, widths: &TableWidths) -> String {
         .as_ref()
         .map(|workspace| util::truncate(&workspace.title, widths.workspace))
         .unwrap_or_else(|| "未识别".to_string());
-    let bili = if session.bili.is_some() {
+    let attached = if session.bili.is_some() {
         util::human_bytes(session.bili_bytes())
+    } else if session.magic.is_some() {
+        format!("{} 间", session.magic_compartments())
     } else {
         "--".to_string()
     };
@@ -419,7 +432,7 @@ fn session_row(session: &Session, widths: &TableWidths) -> String {
         ),
         pad_right(&workspace, widths.workspace),
         pad_right(&session.size_label(), widths.size),
-        pad_right(&bili, widths.bili),
+        pad_right(&attached, widths.bili),
         pad_right(&session.messages.to_string(), widths.messages),
         pad_right(
             if session.locked {
@@ -697,6 +710,14 @@ fn doctor() -> Result<()> {
     if bili > 0 {
         println!("其中 billion-context 数据 {}", util::human_bytes(bili));
     }
+    let magic: u32 = snapshot
+        .sessions
+        .iter()
+        .map(Session::magic_compartments)
+        .sum();
+    if magic > 0 {
+        println!("其中 magic-context 记录 {magic} 个隔间");
+    }
 
     let zstd = which("zstd");
     println!(
@@ -767,6 +788,46 @@ fn doctor() -> Result<()> {
             }
         }
         None => println!("  未检测到（没有找到 sessions/index.db）"),
+    }
+
+    println!("\nmagic-context");
+    match &snapshot.magic {
+        Some(summary) if summary.known() => {
+            for database in &summary.databases {
+                println!("  数据库：{}", database.display());
+                if let Some(modified) = magic::modified(database) {
+                    println!("        最后写入：{}", util::local_datetime(modified));
+                }
+                let side: Vec<String> = magic::side_files(database)
+                    .iter()
+                    .filter_map(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().to_string())
+                    .collect();
+                if !side.is_empty() {
+                    println!("        伴生文件：{}", side.join(" · "));
+                }
+            }
+            println!(
+                "  关联 Opencode 会话 {} 个 · 隔间 {} 个",
+                summary.sessions(),
+                summary.compartments
+            );
+            if summary.orphans > 0 {
+                println!(
+                    "  残留 {} 个：magic-context 里还有、opencode 侧已找不到的会话记录（经 SessTui 删除的会话不会留下这种记录）。",
+                    summary.orphans
+                );
+            }
+            for error in &summary.errors {
+                println!("  错误：{error}");
+            }
+        }
+        Some(summary) => {
+            for error in &summary.errors {
+                println!("  错误：{error}");
+            }
+        }
+        None => println!("  未检测到（没有找到 cortexkit/magic-context/context.db）"),
     }
 
     println!("\n配置：{}", Config::path().display());
