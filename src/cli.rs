@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use serde_json::json;
 use unicode_width::UnicodeWidthStr;
 
+use crate::bili;
 use crate::config::Config;
 use crate::delete;
 use crate::model::{self, Client, Session, WorkspaceGroup};
@@ -167,6 +168,13 @@ fn list(client: Option<&str>, workspace: Option<&str>, json: bool) -> Result<()>
                         "title": workspace.title,
                     })),
                     "bytes": session.bytes,
+                    "bili": session.bili.as_ref().map(|meta| json!({
+                        "db": meta.db.display().to_string(),
+                        "bytes": meta.bytes,
+                        "messages": meta.messages,
+                        "status": meta.status,
+                        "updated": meta.updated.map(util::local_datetime),
+                    })),
                     "messages": session.messages,
                     "locked": session.locked,
                     "tokens_input": session.tokens.map(|tokens| tokens.0),
@@ -195,7 +203,8 @@ fn list(client: Option<&str>, workspace: Option<&str>, json: bool) -> Result<()>
     for session in &sessions {
         println!("{}", session_row(session, &widths));
     }
-    let bytes: u64 = sessions.iter().map(|session| session.bytes).sum();
+    let bytes: u64 = sessions.iter().map(Session::total_bytes).sum();
+    let bili: u64 = sessions.iter().map(Session::bili_bytes).sum();
     println!(
         "\n共 {} 个会话 · {}\n客户端：DSH {} · Codex {} · Opencode {}",
         sessions.len(),
@@ -204,6 +213,9 @@ fn list(client: Option<&str>, workspace: Option<&str>, json: bool) -> Result<()>
         count_client(&sessions, Client::Codex),
         count_client(&sessions, Client::Opencode),
     );
+    if bili > 0 {
+        println!("其中 billion-context 数据 {}", util::human_bytes(bili));
+    }
     if let Some(group) = &workspace {
         println!(
             "工作区：{} · {}",
@@ -289,6 +301,7 @@ struct TableWidths {
     updated: usize,
     workspace: usize,
     size: usize,
+    bili: usize,
     messages: usize,
 }
 
@@ -320,6 +333,7 @@ impl TableWidths {
                 .max()
                 .unwrap_or(6)
                 .max(6),
+            bili: 7,
             messages: 5,
         }
     }
@@ -370,11 +384,12 @@ fn pad_right(text: &str, width: usize) -> String {
 
 fn header_row(widths: &TableWidths) -> String {
     format!(
-        "{}  {}  {}  {}  {}  {}  {}",
+        "{}  {}  {}  {}  {}  {}  {}  {}",
         pad_right("客户端", widths.client),
         pad_right("更新时间", widths.updated),
         pad_right("工作区", widths.workspace),
         pad_right("大小", widths.size),
+        pad_right("bili", widths.bili),
         pad_right("消息", widths.messages),
         pad_right("状态", 6),
         "标题"
@@ -387,8 +402,13 @@ fn session_row(session: &Session, widths: &TableWidths) -> String {
         .as_ref()
         .map(|workspace| util::truncate(&workspace.title, widths.workspace))
         .unwrap_or_else(|| "未识别".to_string());
+    let bili = if session.bili.is_some() {
+        util::human_bytes(session.bili_bytes())
+    } else {
+        "--".to_string()
+    };
     format!(
-        "{}  {}  {}  {}  {}  {}  {}",
+        "{}  {}  {}  {}  {}  {}  {}  {}",
         pad_right(session.client.label(), widths.client),
         pad_right(
             &session
@@ -399,6 +419,7 @@ fn session_row(session: &Session, widths: &TableWidths) -> String {
         ),
         pad_right(&workspace, widths.workspace),
         pad_right(&session.size_label(), widths.size),
+        pad_right(&bili, widths.bili),
         pad_right(&session.messages.to_string(), widths.messages),
         pad_right(
             if session.locked {
@@ -490,6 +511,7 @@ fn delete_workspace_cmd(
     let mut bytes = 0u64;
     let mut skipped = 0usize;
     let mut errors: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     let mut deregistered = 0usize;
     let mut rows = Vec::new();
     for group in &targets {
@@ -503,6 +525,7 @@ fn delete_workspace_cmd(
         bytes += report.bytes;
         skipped += report.skipped;
         errors.extend(report.errors.iter().cloned());
+        warnings.extend(report.warnings.iter().cloned());
         if report.deregistered {
             deregistered += 1;
         }
@@ -522,6 +545,7 @@ fn delete_workspace_cmd(
                     "skipped": report.skipped,
                     "deregistered": report.deregistered,
                     "errors": report.errors,
+                    "warnings": report.warnings,
                 })
             })
             .collect();
@@ -534,6 +558,7 @@ fn delete_workspace_cmd(
                 "skipped": skipped,
                 "deregistered": deregistered,
                 "errors": errors,
+                "warnings": warnings,
                 "workspaces": items,
             }))?
         );
@@ -569,6 +594,9 @@ fn delete_workspace_cmd(
         if deregistered > 0 {
             println!("已移除 {deregistered} 个工作区登记；项目目录保持原样。");
         }
+        for warning in &warnings {
+            println!("提示：{warning}");
+        }
         for error in &errors {
             println!("错误：{error}");
         }
@@ -600,6 +628,7 @@ fn delete_cmd(ids: &[String], dry_run: bool, client: Option<&str>, json: bool) -
                 "deleted": report.deleted,
                 "bytes": report.bytes,
                 "errors": report.errors,
+                "warnings": report.warnings,
             }))?
         );
     } else {
@@ -615,7 +644,7 @@ fn delete_cmd(ids: &[String], dry_run: bool, client: Option<&str>, json: bool) -
                 "{status} {} · {}（{}）",
                 session.client.label(),
                 session.title,
-                util::human_bytes(session.bytes)
+                util::human_bytes(session.total_bytes())
             );
         }
         println!(
@@ -624,6 +653,9 @@ fn delete_cmd(ids: &[String], dry_run: bool, client: Option<&str>, json: bool) -
             util::human_bytes(report.bytes),
             if dry_run { "（演练）" } else { "" }
         );
+        for warning in &report.warnings {
+            println!("提示：{warning}");
+        }
         for error in &report.errors {
             println!("错误：{error}");
         }
@@ -654,12 +686,17 @@ fn doctor() -> Result<()> {
         );
     }
     let groups = workspace_groups(&snapshot, None);
+    let bytes: u64 = snapshot.sessions.iter().map(Session::total_bytes).sum();
+    let bili: u64 = snapshot.sessions.iter().map(Session::bili_bytes).sum();
     println!(
         "\n合计 {} 个会话 · {} 个工作区 · {}",
         snapshot.sessions.len(),
         groups.len(),
-        util::human_bytes(snapshot.bytes(None))
+        util::human_bytes(bytes)
     );
+    if bili > 0 {
+        println!("其中 billion-context 数据 {}", util::human_bytes(bili));
+    }
 
     let zstd = which("zstd");
     println!(
@@ -691,6 +728,47 @@ fn doctor() -> Result<()> {
     for warning in &snapshot.warnings {
         println!("  警告：{warning}");
     }
+
+    println!("\nbillion-context");
+    match &snapshot.bili {
+        Some(summary) if summary.known() => {
+            for database in &summary.databases {
+                println!("  数据库：{}", database.display());
+                if let Some(modified) = bili::modified(database) {
+                    println!("        最后写入：{}", util::local_datetime(modified));
+                }
+                let side: Vec<String> = bili::side_files(database)
+                    .iter()
+                    .filter_map(|path| path.file_name())
+                    .map(|name| name.to_string_lossy().to_string())
+                    .collect();
+                if !side.is_empty() {
+                    println!("        伴生文件：{}", side.join(" · "));
+                }
+            }
+            println!(
+                "  关联 DSH 会话 {} 个 · 占用 {}",
+                summary.sessions(),
+                util::human_bytes(summary.bytes)
+            );
+            if summary.orphans > 0 {
+                println!(
+                    "  残留 {} 个：bili 库里还有、DSH 侧已找不到的会话记录（经 SessTui 删除的会话不会留下这种记录）。",
+                    summary.orphans
+                );
+            }
+            for error in &summary.errors {
+                println!("  错误：{error}");
+            }
+        }
+        Some(summary) => {
+            for error in &summary.errors {
+                println!("  错误：{error}");
+            }
+        }
+        None => println!("  未检测到（没有找到 sessions/index.db）"),
+    }
+
     println!("\n配置：{}", Config::path().display());
     Ok(())
 }

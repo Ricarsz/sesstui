@@ -98,6 +98,20 @@ impl Workspace {
     }
 }
 
+/// billion-context 为同一个 DSH 会话留下的存储记录。
+///
+/// bili 的 `session_id` 与 DSH 会话目录同名，所以扫描时能直接按 id 对上。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BiliMeta {
+    /// 记录所在的 `index.db`。
+    pub db: PathBuf,
+    /// 内容字节数（按内容 hash 去重后累加）。
+    pub bytes: u64,
+    pub messages: u32,
+    pub updated: Option<SystemTime>,
+    pub status: String,
+}
+
 /// 一条会话记录。
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -120,6 +134,8 @@ pub struct Session {
     pub tokens: Option<(u64, u64)>,
     pub cost: Option<f64>,
     pub locked: bool,
+    /// billion-context 侧的同一会话；没接入或没数据时为空。
+    pub bili: Option<BiliMeta>,
 }
 
 impl Session {
@@ -147,6 +163,36 @@ impl Session {
 
     pub fn size_label(&self) -> String {
         util::human_bytes(self.bytes)
+    }
+
+    /// billion-context 侧的占用；没接入时是 0。
+    pub fn bili_bytes(&self) -> u64 {
+        self.bili.as_ref().map_or(0, |meta| meta.bytes)
+    }
+
+    /// 删除时总共会释放的字节数（会话自身 + bili 附带的数据）。
+    pub fn total_bytes(&self) -> u64 {
+        self.bytes + self.bili_bytes()
+    }
+
+    /// 关键字过滤：标题、标识、目录、工作区名与客户端名。
+    pub fn matches(&self, filter: &str) -> bool {
+        if filter.is_empty() {
+            return true;
+        }
+        let haystack = format!(
+            "{} {} {} {} {}",
+            self.title,
+            self.id,
+            self.cwd.as_deref().unwrap_or(""),
+            self.workspace
+                .as_ref()
+                .map(|workspace| workspace.title.as_str())
+                .unwrap_or(""),
+            self.client.label()
+        )
+        .to_lowercase();
+        haystack.contains(filter)
     }
 
     pub fn workspace_key(&self) -> Option<String> {
@@ -274,7 +320,7 @@ pub fn group_workspaces(sessions: &[Session], known: &[Workspace]) -> Vec<Worksp
             locked: 0,
         });
         group.indices.push(index);
-        group.bytes += session.bytes;
+        group.bytes += session.total_bytes();
         group.messages += session.messages;
         group.locked += usize::from(session.locked);
         let updated = session.updated;
@@ -322,6 +368,7 @@ mod tests {
             tokens: None,
             cost: None,
             locked: false,
+            bili: None,
         }
     }
 

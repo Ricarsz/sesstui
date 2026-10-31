@@ -3,6 +3,7 @@
 #![recursion_limit = "256"]
 
 mod app;
+mod bili;
 mod cli;
 mod config;
 mod delete;

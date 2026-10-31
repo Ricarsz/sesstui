@@ -8,9 +8,11 @@
 - **Codex**（`~/.codex`，含 `CODEX_HOME` 形式的独立实例）
 - **Opencode**（`~/.local/share/opencode/opencode.db`）
 
-所有会话汇总到一个列表里，显示标题、所属工作区、最后更新、占用空间、消息数和是否正在使用；
-按 `w` 可以切到工作区视图，按工作区聚合查看会话，并一次性删掉整个工作区。
-支持多选删除、按客户端切换、按关键字过滤，删除前要确认，也可以只演练。
+会话按「工作区 → 会话」的树形排在一个视图里：工作区标题行显示会话数、总大小和最近更新，
+默认展开，`Enter` 或 `←`/`→` 可以折叠；会话行缩进显示更新时间、客户端、标题和大小。
+支持多选删除、整组删除工作区、按客户端切换、按关键字过滤，删除前要确认，也可以只演练。
+
+经过 billion-context 代理的 DSH 会话会标出附带数据的大小，删除时一并清理。
 
 ## 安装
 
@@ -57,14 +59,15 @@ sesstui config --init   # 写入默认配置
 
 | 按键 | 作用 |
 | --- | --- |
-| `↑` `↓` / `k` `j` | 选择会话 |
+| `↑` `↓` / `k` `j` | 在树上移动（工作区标题行与会话行） |
 | `PgUp` `PgDn` | 翻 10 行 |
 | `Home` `End` | 跳到首尾 |
-| `空格` | 勾选 / 取消勾选并下移 |
-| `a` | 全选当前视图 / 取消全选 |
-| `d` | 删除（会话：有勾选删勾选；工作区：删整个工作区） |
-| `w` | 切换会话 / 工作区视图 |
-| `Enter` / `l` | 在工作区视图里钻进去，只看该工作区的会话 |
+| `Enter` | 折叠 / 展开当前工作区 |
+| `←` / `h` | 折叠当前工作区（会话行会跳回它的标题行） |
+| `→` / `l` | 展开当前工作区 |
+| `空格` | 会话：勾选并下移；工作区：整组勾选 / 取消 |
+| `a` | 全选可见会话 / 取消全选 |
+| `d` | 删除（有勾选删勾选；工作区行删整个工作区） |
 | `Tab` / `Shift+Tab` | 切换客户端视图 |
 | `/` | 按标题、ID、目录、工作区过滤 |
 | `J` / `K` | 滚动右侧详情 |
@@ -85,7 +88,7 @@ sesstui config --init   # 写入默认配置
 
 识别不到工作区的会话按客户端归到「未识别工作区」一组，只能逐个删除。
 
-在 TUI 里按 `w` 切到工作区视图，`Enter` 钻进去只看该工作区的会话，`d` 删除整个工作区；
+TUI 里工作区标题行默认展开，按 `Enter` 或 `←`/`→` 折叠、展开；在标题行按 `d` 删除整个工作区，
 命令行对应 `sesstui workspaces` 与 `sesstui delete-workspace <spec>`。
 
 删除工作区做两件事：删掉它名下的会话，再移除工作区登记（DeepSeek Harness 改
@@ -99,6 +102,7 @@ sesstui config --init   # 写入默认配置
 | DeepSeek Harness | `~/.dsh*/sessions/<workspace>/session-<uuid>/` | 删除整个会话目录；`session.lock` 被占用时跳过 |
 | Codex | `~/.codex*/sessions/YYYY/MM/DD/rollout-*.jsonl` | 删除 rollout 文件，并同步移除 `session_index.jsonl` 里的记录 |
 | Opencode | `~/.local/share/opencode/opencode.db` | 在事务里删除 `session_v2` 行，消息等子表由外键级联删除 |
+| billion-context | `~/.local/share/billion-context/sessions/index.db` | 随 DSH 会话一起删除：事务内清掉同名 `session_id` 的各表记录，并回收无人引用的 `content` |
 
 扫描位置可以用环境变量覆盖，多个路径用 `:` 分隔：
 
@@ -106,10 +110,25 @@ sesstui config --init   # 写入默认配置
 SESSTUI_DSH_ROOT=~/.dsh-alt sesstui list
 SESSTUI_CODEX_HOME=~/.codex-alt sesstui doctor
 SESSTUI_OPENCODE_DIR=/path/to/opencode sesstui list
+SESSTUI_BILI_DIR=/path/to/billion-context sesstui doctor
 ```
 
 若多个根目录的 `sessions/` 指向同一份存储（例如用符号链接共享），只会列一次，
 并在 `doctor` 里提示已合并。
+
+## billion-context 联动
+
+DSH 会话只要经过 billion-context 代理，就会在 `sessions/index.db` 里留下同名记录
+（`session_id` 与 DSH 会话目录同名）。SessTui 打开时会扫这份库：
+
+- 会话行的客户端标记后带 `•`，大小列与头部统计都包含它的附带数据；
+- 详情面板显示附带数据大小、消息数、最后更新和数据库路径；
+- 删除 DSH 会话时在同一个事务里清掉 `messages`、`blocks`、`refs`、`checkpoints`
+  等表里该会话的行，再回收没人引用的 `content`；
+- 清理失败不会影响 DSH 会话本身的删除，只在状态栏给出提示。
+
+`sesstui doctor` 会检查数据库、`-wal`/`-shm`/锁文件，并统计对不上 DSH 的残留记录。
+数据根可用 `SESSTUI_BILI_DIR` 覆盖，指向目录或 `index.db` 都行。
 
 ## 配置
 
@@ -128,6 +147,7 @@ confirm_delete = true  # 删除前弹确认框
 - DeepSeek Harness 会话被其他进程加锁时直接跳过，不会强删。
 - Opencode 的删除在单个事务里完成，失败会整体回滚。
 - 删除工作区只清理会话存储与登记，项目目录保持原样；有会话删不掉时保留登记。
+- billion-context 的数据在删除 DSH 会话的同一流程里清理；清理失败会保留 DSH 会话的删除结果并提示。
 - `sesstui delete --dry-run` 与 `sesstui delete-workspace --dry-run` 只打印目标，不落盘。
 
 ## 限制

@@ -15,6 +15,8 @@ pub struct Report {
     /// 失败会话的 `client:id`，供界面精确清理勾选状态。
     pub failed: Vec<String>,
     pub errors: Vec<String>,
+    /// 会话已删除、只是附带清理没做完的情况。
+    pub warnings: Vec<String>,
 }
 
 impl Report {
@@ -30,17 +32,22 @@ pub fn delete_many(sessions: &[Session], dry_run: bool) -> Report {
         bytes: 0,
         failed: Vec::new(),
         errors: Vec::new(),
+        warnings: Vec::new(),
     };
     for session in sessions {
         let outcome = if dry_run {
-            Ok(session.bytes)
+            Ok(Outcome {
+                bytes: session.total_bytes(),
+                warnings: Vec::new(),
+            })
         } else {
             delete(session)
         };
         match outcome {
-            Ok(bytes) => {
+            Ok(outcome) => {
                 report.deleted += 1;
-                report.bytes += bytes;
+                report.bytes += outcome.bytes;
+                report.warnings.extend(outcome.warnings);
             }
             Err(error) => {
                 report.failed.push(session.key());
@@ -55,7 +62,13 @@ pub fn delete_many(sessions: &[Session], dry_run: bool) -> Report {
     report
 }
 
-pub fn delete(session: &Session) -> Result<u64> {
+/// 一次删除的结果：释放的字节数，以及不影响会话删除完成度的附带问题。
+pub struct Outcome {
+    pub bytes: u64,
+    pub warnings: Vec<String>,
+}
+
+pub fn delete(session: &Session) -> Result<Outcome> {
     match session.client {
         Client::Dsh => delete_dsh(session),
         Client::Codex => delete_codex(session),
@@ -63,7 +76,7 @@ pub fn delete(session: &Session) -> Result<u64> {
     }
 }
 
-fn delete_dsh(session: &Session) -> Result<u64> {
+fn delete_dsh(session: &Session) -> Result<Outcome> {
     let dir = &session.path;
     let allowed = session.root.join("sessions");
     ensure_inside(dir, &allowed)?;
@@ -87,10 +100,21 @@ fn delete_dsh(session: &Session) -> Result<u64> {
     {
         let _ = fs::remove_dir(parent);
     }
-    Ok(bytes)
+    // billion-context 用同一个会话 id 记账；DSH 删掉后一起清，避免留下孤儿。
+    let mut warnings = Vec::new();
+    let mut bytes = bytes;
+    if let Some(meta) = &session.bili {
+        match crate::bili::delete_session(&meta.db, &session.id) {
+            Ok(extra) => bytes += extra,
+            Err(error) => warnings.push(format!(
+                "DSH 会话已删除，但 billion-context 数据没清理干净：{error:#}"
+            )),
+        }
+    }
+    Ok(Outcome { bytes, warnings })
 }
 
-fn delete_codex(session: &Session) -> Result<u64> {
+fn delete_codex(session: &Session) -> Result<Outcome> {
     let file = &session.path;
     let allowed = session.root.join("sessions");
     ensure_inside(file, &allowed)?;
@@ -107,7 +131,10 @@ fn delete_codex(session: &Session) -> Result<u64> {
     let bytes = fs::metadata(file).map(|meta| meta.len()).unwrap_or(0);
     fs::remove_file(file).with_context(|| format!("删除 {}", file.display()))?;
     drop_codex_index(&session.root.join("session_index.jsonl"), &session.id)?;
-    Ok(bytes)
+    Ok(Outcome {
+        bytes,
+        warnings: Vec::new(),
+    })
 }
 
 /// 从 `session_index.jsonl` 里摘掉对应条目，写回时用临时文件替换。
@@ -144,7 +171,7 @@ fn drop_codex_index(index: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn delete_opencode(session: &Session) -> Result<u64> {
+fn delete_opencode(session: &Session) -> Result<Outcome> {
     let db = &session.path;
     if db
         .file_name()
@@ -162,7 +189,10 @@ fn delete_opencode(session: &Session) -> Result<u64> {
     if removed == 0 {
         bail!("数据库里没有该会话，可能已被删除");
     }
-    Ok(session.bytes)
+    Ok(Outcome {
+        bytes: session.bytes,
+        warnings: Vec::new(),
+    })
 }
 
 /// 删除整个工作区：先逐个删会话，全部成功后再注销工作区登记。
@@ -174,6 +204,8 @@ pub struct WorkspaceReport {
     /// 因为锁或路径校验被跳过的会话数。
     pub skipped: usize,
     pub errors: Vec<String>,
+    /// 会话删掉了、附带清理没做完的提示。
+    pub warnings: Vec<String>,
     /// 是否把登记项（DSH 的 workspace.json、Opencode 的 project 行）也移除了。
     pub deregistered: bool,
 }
@@ -194,18 +226,23 @@ pub fn delete_workspace(
         bytes: 0,
         skipped: 0,
         errors: Vec::new(),
+        warnings: Vec::new(),
         deregistered: false,
     };
     for session in sessions {
         let outcome = if dry_run {
-            Ok(session.bytes)
+            Ok(Outcome {
+                bytes: session.total_bytes(),
+                warnings: Vec::new(),
+            })
         } else {
             delete(session)
         };
         match outcome {
-            Ok(bytes) => {
+            Ok(outcome) => {
                 report.deleted += 1;
-                report.bytes += bytes;
+                report.bytes += outcome.bytes;
+                report.warnings.extend(outcome.warnings);
             }
             Err(error) => {
                 report.skipped += 1;
@@ -400,10 +437,152 @@ fn ensure_inside(child: &Path, parent: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::BiliMeta;
+    use rusqlite::Connection;
+    use std::path::{Path, PathBuf};
+    use std::time::UNIX_EPOCH;
+
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or_default();
+            let path = std::env::temp_dir().join(format!("sesstui-{name}-{stamp}"));
+            fs::create_dir_all(&path).expect("建目录");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn session_dir(root: &Path, id: &str) -> PathBuf {
+        let dir = root.join("sessions").join("--tmp--").join(id);
+        fs::create_dir_all(&dir).expect("建会话目录");
+        fs::write(dir.join("session.jsonl.zstd"), vec![7u8; 2048]).expect("写会话文件");
+        dir
+    }
+
+    /// 一份贴近真实结构的 bili 库：`target` 与 `keep` 两条会话，共享一条 content。
+    fn bili_db(path: &Path) {
+        fs::create_dir_all(path.parent().expect("父目录")).expect("建目录");
+        let conn = Connection::open(path).expect("建库");
+        conn.execute_batch(
+            "CREATE TABLE sessions (session_id TEXT PRIMARY KEY, status TEXT NOT NULL,
+                updated_at INTEGER NOT NULL);
+             CREATE TABLE messages (session_id TEXT NOT NULL, content_hash TEXT NOT NULL);
+             CREATE TABLE blocks (session_id TEXT NOT NULL, summary_hash TEXT NOT NULL,
+                one_hash TEXT);
+             CREATE TABLE message_media (session_id TEXT NOT NULL, media_hash TEXT NOT NULL);
+             CREATE TABLE refs (session_id TEXT NOT NULL);
+             CREATE TABLE dead_refs (session_id TEXT NOT NULL);
+             CREATE TABLE ccr_entries (session_id TEXT NOT NULL, content_hash TEXT NOT NULL);
+             CREATE TABLE checkpoints (session_id TEXT NOT NULL, state_hash TEXT NOT NULL);
+             CREATE TABLE session_ext (session_id TEXT NOT NULL);
+             CREATE TABLE conversations (session_id TEXT NOT NULL);
+             CREATE TABLE content (hash TEXT PRIMARY KEY, byte_len INTEGER NOT NULL);
+             INSERT INTO sessions VALUES ('session-target', 'active', 1700000000000);
+             INSERT INTO sessions VALUES ('session-keep', 'active', 1700000000000);
+             INSERT INTO messages VALUES ('session-target', 'h-shared');
+             INSERT INTO messages VALUES ('session-target', 'h-target');
+             INSERT INTO messages VALUES ('session-keep', 'h-shared');
+             INSERT INTO content VALUES ('h-shared', 100);
+             INSERT INTO content VALUES ('h-target', 50);",
+        )
+        .expect("建表");
+    }
+
+    fn dsh_session(root: &Path, dir: PathBuf, db: PathBuf) -> Session {
+        Session {
+            client: Client::Dsh,
+            id: "session-target".to_string(),
+            title: "测试会话".to_string(),
+            preview: String::new(),
+            path: dir,
+            root: root.to_path_buf(),
+            cwd: None,
+            workspace: None,
+            created: None,
+            updated: None,
+            bytes: 0,
+            messages: 0,
+            tokens: None,
+            cost: None,
+            locked: false,
+            bili: Some(BiliMeta {
+                db,
+                bytes: 150,
+                messages: 2,
+                updated: None,
+                status: "active".to_string(),
+            }),
+        }
+    }
 
     #[test]
     fn rejects_paths_outside_root() {
         let error = ensure_inside(Path::new("/etc"), Path::new("/tmp")).unwrap_err();
         assert!(error.to_string().contains("拒绝删除"));
+    }
+
+    #[test]
+    fn deletes_dsh_session_and_its_bili_rows() {
+        let scratch = Scratch::new("delete-bili");
+        let root = scratch.path().join("dsh");
+        let dir = session_dir(&root, "session-target");
+        let db = scratch
+            .path()
+            .join("bili")
+            .join("sessions")
+            .join("index.db");
+        bili_db(&db);
+        let session = dsh_session(&root, dir.clone(), db.clone());
+
+        let outcome = delete(&session).expect("删除");
+
+        assert!(!dir.exists(), "会话目录应该被删除");
+        assert_eq!(outcome.bytes, 2048 + 150, "释放量应含 bili 部分");
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        let conn = Connection::open(&db).expect("打开");
+        let sessions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .expect("计数");
+        assert_eq!(sessions, 1, "只应删掉目标会话的记录");
+        let content: i64 = conn
+            .query_row("SELECT COUNT(*) FROM content", [], |row| row.get(0))
+            .expect("计数");
+        assert_eq!(content, 1, "共享 content 应保留，目标独有的应回收");
+    }
+
+    #[test]
+    fn dsh_delete_survives_a_broken_bili_database() {
+        let scratch = Scratch::new("delete-bili-broken");
+        let root = scratch.path().join("dsh");
+        let dir = session_dir(&root, "session-target");
+        // 文件名不是 index.db，bili 删除会拒绝；DSH 会话仍应删掉并给出提示。
+        let db = scratch
+            .path()
+            .join("bili")
+            .join("sessions")
+            .join("other.db");
+        bili_db(&db);
+        let session = dsh_session(&root, dir.clone(), db);
+
+        let outcome = delete(&session).expect("删除");
+
+        assert!(!dir.exists());
+        assert_eq!(outcome.bytes, 2048);
+        assert_eq!(outcome.warnings.len(), 1, "{:?}", outcome.warnings);
+        assert!(outcome.warnings[0].contains("billion-context"));
     }
 }

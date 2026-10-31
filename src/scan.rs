@@ -36,17 +36,11 @@ pub struct Snapshot {
     pub workspaces: Vec<Workspace>,
     pub roots: Vec<Root>,
     pub warnings: Vec<String>,
+    /// billion-context 的存储概况；本机没装 bili 时为空。
+    pub bili: Option<crate::bili::Summary>,
 }
 
-impl Snapshot {
-    pub fn bytes(&self, client: Option<Client>) -> u64 {
-        self.sessions
-            .iter()
-            .filter(|session| client.is_none_or(|c| session.client == c))
-            .map(|session| session.bytes)
-            .sum()
-    }
-}
+impl Snapshot {}
 
 fn home() -> PathBuf {
     env::var_os("HOME")
@@ -91,6 +85,12 @@ pub fn scan() -> Snapshot {
     });
     dedupe_storage(&mut snapshot);
     dedupe_workspaces(&mut snapshot);
+    snapshot.bili = crate::bili::attach(&mut snapshot.sessions);
+    if let Some(summary) = &snapshot.bili {
+        for error in &summary.errors {
+            snapshot.warnings.push(format!("billion-context：{error}"));
+        }
+    }
     snapshot
 }
 
@@ -439,6 +439,7 @@ fn load_dsh_session(
         tokens: None,
         cost: None,
         locked,
+        bili: None,
     }))
 }
 
@@ -756,6 +757,7 @@ fn load_codex_session(
         tokens: None,
         cost: None,
         locked: false,
+        bili: None,
     })
 }
 
@@ -990,6 +992,7 @@ fn load_opencode_sessions(db: &Path, root: &Path) -> Result<(Vec<Session>, Vec<W
             tokens: Some((tokens_in.max(0) as u64, tokens_out.max(0) as u64)),
             cost: Some(cost),
             locked: false,
+            bili: None,
         });
     }
     Ok((sessions, projects))
